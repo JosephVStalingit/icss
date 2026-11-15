@@ -100,9 +100,11 @@ icss erasure-check [--data-shards K] [--parity-shards M] [--lost N]
 icss node --listen PORT [--broadcast-port PORT] [--chunk-size BYTES]
            [--queue-depth N] [--ring-id ID] [--index-path PATH] [--next IP:PORT]
 icss inject FILE IP:PORT [--key KEYFILE] [--ring-id ID] [--chunk-size BYTES]
-                   [--data-shards K] [--parity-shards M]
-icss fetch FILE_SHA256 OUTPUT_FILE IP:PORT [--key KEYFILE] [--ring-id ID]
-icss status IP:PORT [--ring-id ID] [--list-files]
+                    [--data-shards K] [--parity-shards M]
+icss fetch [FILE_SHA256|--name NAME] OUTPUT_FILE [IP:PORT] [--key KEYFILE] [--ring-id ID]
+                    [--discovery-port PORT]
+icss status IP:PORT [--ring-id ID] [--list-files] [--discovery-port PORT]
+icss ls [IP:PORT] [--key KEYFILE] [--ring-id ID] [--discovery-port PORT]
 ```
 
 ### node
@@ -128,23 +130,41 @@ icss inject dataset.bin 10.0.0.1:9001 --chunk-size 1048576 \
 
 输出文件根哈希、总分片数、分组数和纠删码参数到 stdout。
 
+**文件名唯一性**：同一个密钥下，文件名不可重复。注入时若目标节点已存在同名且同密钥的数据集，会拒绝注入并报错。未加密的数据集视为使用空密钥，同名未加密文件也不可重复。
+
 ### fetch
 
 ```sh
 icss fetch <64位SHA256> restored.bin 10.0.0.1:9001
 icss fetch <64位SHA256> restored.bin 10.0.0.1:9001 --key key.bin
+# 按文件名读取，无需 SHA-256，在整个环流中查找：
+icss fetch --name dataset.bin restored.bin 10.0.0.1:9001 --key key.bin
+icss fetch --name dataset.bin restored.bin --key key.bin
 ```
 
 读取端按需收集分片：只要每组拿到 k 片就能重建，不必等齐全部 k+m 片。完成后校验整文件 SHA-256，不匹配则报错并删除输出。
+
+使用 `--name` 时，在整个环流中查找该文件名：通过 UDP 发现所有节点，逐个查询目录，匹配文件名并验证密钥指纹（加密数据集仅返回与给定密钥匹配的条目）。IP:PORT 可选，省略时自动环路发现；文件名在同一密钥下必须唯一。
 
 ### status
 
 ```sh
 icss status 10.0.0.1:9001
 icss status 10.0.0.1:9001 --list-files
+icss status 10.0.0.1:9001 --list-files --discovery-port 7777
 ```
 
-单行 JSON，包含 `online_nodes`、`upstream`、`downstream`、`ring_id`、`chunk_size`、`queue_usage`、`queue_capacity`、`total_forwarded`、`dropped_frames`、`permanent_files`、`uptime`，`--list-files` 额外列出数据集哈希。
+单行 JSON，包含 `online_nodes`、`upstream`、`downstream`、`ring_id`、`chunk_size`、`queue_usage`、`queue_capacity`、`total_forwarded`、`dropped_frames`、`permanent_files`、`uptime`。`--list-files` 额外列出整个环流中的数据集（通过 UDP 发现所有节点并逐个查询目录）。
+
+### ls
+
+```sh
+icss ls 10.0.0.1:9001
+icss ls 10.0.0.1:9001 --key key.bin --ring-id 1
+icss ls --key key.bin --ring-id 1
+```
+
+列出数据集目录，包含文件名、SHA-256、是否加密、密钥指纹。不提供 IP:PORT 时，通过 UDP 发现环内所有节点并列出整个环流的目录。`--key` 时只列出该密钥能解密的数据集。
 
 ## 协议
 
@@ -206,6 +226,43 @@ Unix 下 SIGINT 和 SIGTERM 停止节点并持久化索引，SIGUSR1 打印运�
 `--queue-depth` 控制下游队列深度，`--chunk-size` 控制单帧大小。队列深度乘以分片大小大致是每个节点的稳态内存占用上限。
 
 ## Hyper-V 环流存储可行性测试
+
+### 一键自动化部署（推荐）
+
+`Deploy-ICSS-HyperV-FullAuto.ps1` 可以在 Hyper-V 上自动完成整个流程：创建 3 个 Ubuntu
+24.04 云镜像 VM、编译 ICSS、闭环成环并跑完注入/读取/纠删码测试。
+
+```powershell
+# 清理上一轮遗留的 VM
+powershell -ExecutionPolicy Bypass -File d:\icss\cleanup-vms.ps1
+
+# 完整部署 + 测试（建议以管理员身份运行）
+powershell -ExecutionPolicy Bypass -File d:\icss\Deploy-ICSS-HyperV-FullAuto.ps1 -TestFileSize 100MB
+```
+
+脚本执行的内容：
+
+| 步骤 | 说明 |
+|------|------|
+| 1 | 下载 Ubuntu 24.04 cloud 镜像并用 `qemu-img` 转成 VHDX（`subformat=fixed`），再清除稀疏标志 |
+| 2 | 用 `xorriso` 生成卷标为 `cidata` 的 cloud-init seed ISO（密码 `icss123` + SSH 密钥 + DHCP） |
+| 3 | 创建 3 个 Gen2 VM（2 vCPU / 4 GB / 差分磁盘），关闭 Secure Boot |
+| 4 | 从宿主机 ARP 表按 MAC 解析各节点 IP，并用端口探测校验 |
+| 5 | 并行在 3 个节点上 `apt install build-essential libssl-dev git && make` |
+| 6 | 用 `setsid -f` 启动 3 节点环（port 9001），并逐节点校验端口监听 |
+| 7 | 测试 1：明文注入/读取 100 MB，校验 SHA-256 |
+| 8 | 测试 2：AES-256-GCM 加密 + 纠删码 k=4/m=2 注入/读取，校验 SHA-256 |
+| 9 | 测试 3：三节点 `erasure-check --lost 2` 恢复自检 |
+
+> **注意**：Ubuntu cloud image 不提供 Hyper-V 的 "Guest Service Interface" 集成组件，
+> 因此 `(Get-VM).NetworkAdapters.IPAddresses` 永远是空的。脚本改用宿主机 ARP 表
+> （`Get-NetNeighbor`）按各 VM 的 MAC 地址反查 DHCP 租约。
+
+测试结束后 3 个 VM 仍在运行，可直接登录继续手工验证：
+
+```powershell
+ssh -i C:\VMs\ICSS-Cluster\icss_key icss@<节点IP>
+```
 
 ### 测试环境搭建
 

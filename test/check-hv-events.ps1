@@ -1,1 +1,0 @@
-Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-Worker-Admin' -MaxEvents 30 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'icss' } | Format-List TimeCreated,Id,Message

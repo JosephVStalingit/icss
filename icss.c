@@ -55,18 +55,20 @@ typedef SOCKET icss_socket_t;
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <unistd.h>
 typedef int icss_socket_t;
 #define ICSS_INVALID_SOCKET (-1)
 #define icss_socket_close close
 #endif
 
-#define ICSS_VERSION "0.2.0-prototype"
+#define ICSS_VERSION "0.3.0-prototype"
 #define ICSS_DEFAULT_CHUNK_SIZE (16U * 1024U * 1024U)
-#define ICSS_HEADER_SIZE 144U
+#define ICSS_HEADER_SIZE 240U
 #define ICSS_MAGIC "ICSS"
 #define ICSS_CONTROL_MAGIC "ICSF"
-#define ICSS_FRAME_VERSION 1U
+#define ICSS_FRAME_VERSION 2U
 #define ICSS_FLAG_ENCRYPTED 0x01U
 #define ICSS_CONTROL_SIZE 8U
 #define ICSS_MAX_CHUNKS 1000000U
@@ -77,12 +79,21 @@ typedef int icss_socket_t;
 #define ICSS_PEER_TIMEOUT 30
 #define ICSS_MAX_SHARDS 64U
 #define ICSS_DEFAULT_QUEUE_DEPTH 32U
+#define ICSS_QUEUE_MAX_FRAMES 65536U
 #define ICSS_PAUSE_HIGH_PERCENT 80U
 #define ICSS_RESUME_LOW_PERCENT 30U
 #define ICSS_DEDUP_WINDOW 4096U
 #define ICSS_FETCH_PENDING_SLOTS 64U
 #define ICSS_FETCH_TIMEOUT_SECONDS 120
 #define ICSS_SUBSCRIBER_POLL_SECONDS 5
+/*
+ * The original file name travels with every frame. It is the human readable
+ * part of the catalogue that "icss ls" prints; the content hash stays the
+ * authoritative identity of a dataset.
+ */
+#define ICSS_NAME_SIZE 64U
+/* Length of the key fingerprint: SHA-256 over the raw 32 byte AES key. */
+#define ICSS_KEY_ID_SIZE 32U
 
 typedef struct icss_subscriber {
     icss_socket_t socket;
@@ -98,6 +109,14 @@ typedef struct icss_index_entry {
     uint64_t last_seen;
     unsigned char **chunk_hashes;
     unsigned char *chunk_seen;
+    /*
+     * Catalogue metadata. The name is the label of the dataset and the key id
+     * identifies the AES key that protects it, so that "icss ls --key" can
+     * report exactly which datasets the given key is able to decrypt.
+     */
+    unsigned char key_id[ICSS_KEY_ID_SIZE];
+    char name[ICSS_NAME_SIZE];
+    int encrypted;
     struct icss_index_entry *next;
 } icss_index_entry;
 
@@ -113,7 +132,28 @@ typedef struct {
     unsigned char node_id[16];
 } icss_peer;
 
-#define ICSS_AAD_SIZE 64U
+/*
+ * Size of the AES-GCM additional authenticated data.
+ *
+ * The layout is:
+ *   0   4   magic
+ *   4   1   version
+ *   5   1   flags
+ *   6   2   ring id
+ *   8   4   chunk id
+ *  12   4   total chunks
+ *  16   8   file size
+ *  24   4   chunk size
+ *  28   4   payload size
+ *  32  32   file hash
+ *  64  32   key id
+ *  96  64   file name
+ * = 160 bytes
+ *
+ * The catalogue fields are part of the authenticated data, so a relay cannot
+ * rename a dataset or claim a different key without breaking the tag.
+ */
+#define ICSS_AAD_SIZE 160U
 
 /*
  * Wire frame header.
@@ -143,6 +183,13 @@ typedef struct {
     uint8_t shard_pos;        /* position inside the erasure group, 0..k+m-1 */
     uint8_t reserved;
     uint32_t shard_group;     /* erasure group index */
+    /*
+     * Catalogue fields. The name is the human readable label of the dataset and
+     * the key id identifies the AES key that protects it, so that a reader can
+     * tell with a single key which datasets it is able to decrypt.
+     */
+    unsigned char key_id[ICSS_KEY_ID_SIZE];
+    char name[ICSS_NAME_SIZE];
 } icss_frame_header;
 
 /*
@@ -175,6 +222,10 @@ static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t index_mutex = PTHREAD_MUTEX_INITIALIZER;
 static icss_subscriber *subscribers;
 static icss_index_entry *index_entries;
+
+/* Forward declaration for the bounded string copy helper. */
+static void copy_bounded(char *destination, size_t capacity, const char *source);
+
 static volatile sig_atomic_t node_running = 1;
 static volatile sig_atomic_t node_status_requested;
 static uint16_t node_ring_id;
@@ -208,6 +259,23 @@ static volatile int node_outbound_paused;
 #define ICSS_OP_STATUS 'S'
 #define ICSS_OP_PAUSE 'P'
 #define ICSS_OP_RESUME 'R'
+#define ICSS_OP_LIST 'L'
+
+/* FETCH control frame flags */
+#define ICSS_FETCH_FLAG_NAME   0x01U  /* body contains name instead of hash */
+#define ICSS_FETCH_FLAG_KEYID  0x02U  /* body contains key_id for ownership check */
+
+/* FETCH control frame operation codes */
+#define ICSS_OP_ERROR 'E'             /* error reply to a fetch/list request */
+
+/* Forward declarations for functions used before their definition. */
+static int lookup_hash_by_name(const char *name,
+    const unsigned char key_id[ICSS_KEY_ID_SIZE], int have_key_id,
+    unsigned char out_hash[32]);
+static int send_control(icss_socket_t socket, char operation, uint16_t ring_id,
+    uint8_t flags);
+static int json_get_string(const char *json, const char *field, char *out,
+    size_t out_capacity);
 
 static int sha256_buffer(const unsigned char *data, size_t size,
     unsigned char digest[32]);
@@ -316,6 +384,8 @@ static int encode_frame_header(const icss_frame_header *header,
     output[138] = header->shard_pos;
     output[139] = header->reserved;
     put_u32(output + 140, header->shard_group);
+    memcpy(output + 144, header->key_id, ICSS_KEY_ID_SIZE);
+    memcpy(output + 176, header->name, ICSS_NAME_SIZE);
     return 1;
 }
 
@@ -345,6 +415,9 @@ static int decode_frame_header(const unsigned char input[ICSS_HEADER_SIZE],
     header->shard_pos = input[138];
     header->reserved = input[139];
     header->shard_group = get_u32(input + 140);
+    memcpy(header->key_id, input + 144, ICSS_KEY_ID_SIZE);
+    memcpy(header->name, input + 176, ICSS_NAME_SIZE);
+    header->name[ICSS_NAME_SIZE - 1U] = '\0';
     if (header->data_shards == 0U ||
         header->data_shards + header->parity_shards > ICSS_MAX_SHARDS ||
         header->shard_pos >= header->data_shards + header->parity_shards) {
@@ -387,17 +460,56 @@ static void build_frame_aad(const icss_frame_header *header,
     put_u32(aad + 24, header->chunk_size);
     put_u32(aad + 28, header->payload_size);
     memcpy(aad + 32, header->file_hash, 32);
+    memcpy(aad + 64, header->key_id, ICSS_KEY_ID_SIZE);
+    memcpy(aad + 96, header->name, ICSS_NAME_SIZE);
 }
 
-static icss_index_entry *find_index_entry(const unsigned char file_hash[32])
+/*
+ * Look up the catalogue entry of one concrete dataset layout.
+ *
+ * A dataset is identified by its content hash *and* by the number of frames it
+ * was split into. The chunk indices only carry a meaning inside one erasure
+ * layout, so the same file injected with different parameters describes a
+ * different set of chunks. Keying the catalogue by both values lets several
+ * layouts of the same file coexist instead of colliding.
+ */
+static icss_index_entry *find_index_entry_layout(const unsigned char file_hash[32],
+    uint32_t total_chunks)
 {
     icss_index_entry *entry;
     for (entry = index_entries; entry != NULL; entry = entry->next) {
-        if (memcmp(entry->file_hash, file_hash, 32) == 0) {
+        if (entry->total_chunks == total_chunks &&
+            memcmp(entry->file_hash, file_hash, 32) == 0) {
             return entry;
         }
     }
     return NULL;
+}
+
+/*
+ * Report whether any layout of the given file has already been seen.
+ *
+ * The read side only knows the content hash, so it accepts the subscription as
+ * soon as one chunk of one of the layouts is available.
+ */
+static int index_has_seen_chunks(const unsigned char file_hash[32])
+{
+    icss_index_entry *entry;
+    for (entry = index_entries; entry != NULL; entry = entry->next) {
+        uint32_t index;
+        if (memcmp(entry->file_hash, file_hash, 32) != 0) {
+            continue;
+        }
+        if (entry->chunk_seen == NULL) {
+            continue;
+        }
+        for (index = 0; index < entry->total_chunks; ++index) {
+            if (entry->chunk_seen[index]) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static void free_index_entries(void)
@@ -418,7 +530,8 @@ static int save_index(void)
     FILE *file;
     icss_index_entry *entry;
     uint32_t count = 0;
-    unsigned char header[12] = {'I','C','I','X',0,1,0,0,0,0,0,0};
+    /* Format version 2 adds the catalogue metadata to every record. */
+    unsigned char header[12] = {'I','C','I','X',0,2,0,0,0,0,0,0};
     char temporary[1100];
     snprintf(temporary, sizeof(temporary), "%s.tmp", node_index_path);
     pthread_mutex_lock(&index_mutex);
@@ -447,7 +560,18 @@ static int save_index(void)
     for (entry = index_entries; entry != NULL; entry = entry->next) {
         uint32_t index;
         int complete = 1;
-        unsigned char record[52];
+        /*
+         * Record layout (version 2):
+         *   0  32  file hash
+         *  32   4  total chunks
+         *  36   8  first seen
+         *  44   8  last seen
+         *  52   1  encrypted flag
+         *  53  32  key id
+         *  85  63  file name (NUL padded)
+         * = 148 bytes
+         */
+        unsigned char record[148];
         if (entry->chunk_seen == NULL) continue;
         for (index = 0; index < entry->total_chunks; ++index) {
             if (!entry->chunk_seen[index]) {
@@ -456,10 +580,28 @@ static int save_index(void)
             }
         }
         if (!complete) continue;
+        memset(record, 0, sizeof(record));
         memcpy(record, entry->file_hash, 32);
         put_u32(record + 32, entry->total_chunks);
         put_u64(record + 36, entry->first_seen);
         put_u64(record + 44, entry->last_seen);
+        record[52] = (unsigned char)(entry->encrypted ? 1U : 0U);
+        memcpy(record + 53, entry->key_id, ICSS_KEY_ID_SIZE);
+        /*
+         * The name is copied field by field: the record area is already zeroed
+         * above, so a NUL padded copy is enough and avoids the truncation
+         * warning of strncpy.
+         */
+        {
+            /* The length is found without relying on strnlen, which is not
+               available on every supported compiler. */
+            size_t length = 0;
+            while (length < ICSS_NAME_SIZE - 1U && entry->name[length] != '\0') {
+                ++length;
+            }
+            memcpy(record + 85, entry->name, length);
+            record[85 + length] = 0U;
+        }
         if (fwrite(record, 1, sizeof(record), file) != sizeof(record)) {
             fclose(file);
             pthread_mutex_unlock(&index_mutex);
@@ -501,12 +643,20 @@ static int load_index(void)
     unsigned char header[12];
     uint32_t count;
     uint32_t file_number;
+    uint16_t version;
     if (file == NULL) return errno == ENOENT;
     if (fread(header, 1, sizeof(header), file) != sizeof(header) ||
-        memcmp(header, "ICIX", 4) != 0 || get_u16(header + 4) != 1U ||
+        memcmp(header, "ICIX", 4) != 0 ||
         get_u16(header + 6) != node_ring_id) {
         fclose(file);
         fprintf(stderr, "icss: index header invalid or ring mismatch\n");
+        return 0;
+    }
+    version = get_u16(header + 4);
+    /* Version 1 has no catalogue metadata; version 2 adds it to the records. */
+    if (version != 1U && version != 2U) {
+        fclose(file);
+        fprintf(stderr, "icss: unsupported index version %u\n", (unsigned int)version);
         return 0;
     }
     count = get_u32(header + 8);
@@ -516,16 +666,37 @@ static int load_index(void)
         return 0;
     }
     for (file_number = 0; file_number < count; ++file_number) {
-        unsigned char record[52];
+        unsigned char record[148];
+        unsigned char legacy[52];
         icss_index_entry *entry;
         uint32_t index;
-        if (fread(record, 1, sizeof(record), file) != sizeof(record)) goto invalid;
+        if (version == 1U) {
+            if (fread(legacy, 1, sizeof(legacy), file) != sizeof(legacy)) goto invalid;
+            memset(record, 0, sizeof(record));
+            memcpy(record, legacy, 32);
+            put_u32(record + 32, get_u32(legacy + 32));
+            put_u64(record + 36, get_u64(legacy + 36));
+            put_u64(record + 44, get_u64(legacy + 44));
+        } else {
+            if (fread(record, 1, sizeof(record), file) != sizeof(record)) goto invalid;
+        }
         entry = (icss_index_entry *)calloc(1, sizeof(*entry));
         if (entry == NULL) goto invalid;
         memcpy(entry->file_hash, record, 32);
         entry->total_chunks = get_u32(record + 32);
         entry->first_seen = get_u64(record + 36);
         entry->last_seen = get_u64(record + 44);
+        entry->encrypted = record[52] != 0U;
+        memcpy(entry->key_id, record + 53, ICSS_KEY_ID_SIZE);
+        {
+            size_t length = 0;
+            while (length < ICSS_NAME_SIZE - 1U &&
+                   ((const char *)record)[85 + length] != '\0') {
+                ++length;
+            }
+            memcpy(entry->name, (const char *)record + 85, length);
+            entry->name[length] = '\0';
+        }
         if (entry->total_chunks == 0U || entry->total_chunks > ICSS_MAX_CHUNKS) {
             free(entry);
             goto invalid;
@@ -571,7 +742,13 @@ static int record_frame_metadata(const icss_frame_header *header)
     uint32_t index;
     int changed = 0;
     pthread_mutex_lock(&index_mutex);
-    entry = find_index_entry(header->file_hash);
+    /*
+     * The catalogue is keyed by content hash *and* frame count. Injecting the
+     * same file again with a different erasure layout produces a different set
+     * of chunk indices, and those must not overwrite the entries of the layout
+     * that is already circulating.
+     */
+    entry = find_index_entry_layout(header->file_hash, header->total_chunks);
     if (entry == NULL) {
         entry = (icss_index_entry *)calloc(1, sizeof(*entry));
         if (entry == NULL) {
@@ -594,10 +771,22 @@ static int record_frame_metadata(const icss_frame_header *header)
         entry->next = index_entries;
         index_entries = entry;
     }
-    if (entry->total_chunks != header->total_chunks ||
-        header->chunk_id >= entry->total_chunks) {
+    if (header->chunk_id >= entry->total_chunks) {
         pthread_mutex_unlock(&index_mutex);
         return 0;
+    }
+    /* Keep the catalogue metadata in sync with the frames that arrive. */
+    if (memcmp(entry->key_id, header->key_id, ICSS_KEY_ID_SIZE) != 0) {
+        memcpy(entry->key_id, header->key_id, ICSS_KEY_ID_SIZE);
+        changed = 1;
+    }
+    if (entry->encrypted != ((header->flags & ICSS_FLAG_ENCRYPTED) != 0U)) {
+        entry->encrypted = (header->flags & ICSS_FLAG_ENCRYPTED) != 0U;
+        changed = 1;
+    }
+    if (strncmp(entry->name, header->name, ICSS_NAME_SIZE) != 0) {
+        copy_bounded(entry->name, ICSS_NAME_SIZE, header->name);
+        changed = 1;
     }
     chunk_hash = entry->chunk_hashes[header->chunk_id];
     if (chunk_hash == NULL) {
@@ -620,6 +809,40 @@ static int record_frame_metadata(const icss_frame_header *header)
     }
     pthread_mutex_unlock(&index_mutex);
     return index == entry->total_chunks && changed ? save_index() : 1;
+}
+
+/*
+ * Copy a string into a fixed size field and terminate it.
+ *
+ * The helper exists because strncpy does not terminate the destination when
+ * the source is longer than the field, which would leave an unterminated
+ * string in the frame header.
+ */
+static void copy_bounded(char *destination, size_t capacity, const char *source)
+{
+    size_t length = 0;
+    if (capacity == 0U) {
+        return;
+    }
+    while (length + 1U < capacity && source[length] != '\0') {
+        ++length;
+    }
+    memcpy(destination, source, length);
+    destination[length] = '\0';
+}
+
+/*
+ * Fingerprint of an AES key: SHA-256 over the raw 32 key bytes.
+ *
+ * The fingerprint travels with every frame. A reader that is given a key can
+ * therefore decide with a cheap comparison whether it is able to decrypt a
+ * dataset, without having to try the key against the data itself. The
+ * fingerprint is never a secret: knowing it does not help to decrypt anything.
+ */
+static int compute_key_id(const unsigned char key[32],
+    unsigned char key_id[ICSS_KEY_ID_SIZE])
+{
+    return sha256_buffer(key, 32U, key_id);
 }
 
 static int load_aes256_key(const char *path, unsigned char key[32])
@@ -978,6 +1201,9 @@ static int run_self_test(void)
     source.parity_shards = 0U;
     source.shard_pos = 0U;
     source.shard_group = 3U;
+    /* The catalogue fields must survive the header round-trip as well. */
+    memcpy(source.key_id, (const unsigned char *)"0123456789abcdef0123456789abcdef", 32);
+    strcpy(source.name, "sample.bin");
     if (!encode_frame_header(&source, wire) ||
         !decode_frame_header(wire, &decoded, (uint32_t)sizeof(sample)) ||
         decoded.ring_id != source.ring_id || decoded.sequence != source.sequence ||
@@ -987,6 +1213,8 @@ static int run_self_test(void)
         decoded.parity_shards != source.parity_shards ||
         decoded.shard_pos != source.shard_pos ||
         decoded.shard_group != source.shard_group ||
+        memcmp(decoded.key_id, source.key_id, ICSS_KEY_ID_SIZE) != 0 ||
+        strcmp(decoded.name, source.name) != 0 ||
         RAND_bytes(key, (int)sizeof(key)) != 1) {
         fprintf(stderr, "selftest: frame header round-trip failed\n");
         goto cleanup;
@@ -1015,12 +1243,29 @@ static int run_self_test(void)
         fprintf(stderr, "selftest: AAD binding not enforced\n");
         goto cleanup;
     }
+    /* The catalogue fields are part of the AAD as well, so a relay cannot
+       rename a dataset or claim another key without breaking the tag. */
+    source.chunk_id = 1U;
+    memcpy(payload, encrypted, sizeof(payload));
+    source.name[0] = 'X';
+    if (aes256_gcm_decrypt(key, &source, payload, sizeof(payload))) {
+        fprintf(stderr, "selftest: name is not protected by the AAD\n");
+        goto cleanup;
+    }
+    source.name[0] = 's';
+    memcpy(payload, encrypted, sizeof(payload));
+    source.key_id[0] ^= 0x01U;
+    if (aes256_gcm_decrypt(key, &source, payload, sizeof(payload))) {
+        fprintf(stderr, "selftest: key id is not protected by the AAD\n");
+        goto cleanup;
+    }
+    source.key_id[0] ^= 0x01U;
     if (!run_erasure_self_test()) {
         fprintf(stderr, "selftest: erasure coding self-test failed\n");
         goto cleanup;
     }
     puts("selftest: frame encoding, SHA-256, AES-256-GCM, AAD binding, "
-        "erasure coding and tamper rejection passed");
+        "catalogue protection, erasure coding and tamper rejection passed");
     success = 1;
 
 cleanup:
@@ -1232,11 +1477,12 @@ static void notify_subscribers(const icss_frame_header *header,
 /*
  * Backpressure signalling.
  *
- * Direction: a node whose downstream queue overflows tells its own downstream
- * neighbour to stop sending. The neighbour then stops writing into this node
- * and, once its queue drains, tells this node to resume. The signal therefore
- * travels backwards along the ring, hop by hop, so a slow node throttles the
- * whole circulation instead of overflowing a single buffer.
+ * Direction: the node whose queue is filling up is the one that *receives* the
+ * frames, so it has to ask its upstream neighbour - the peer that feeds it -
+ * to stop sending. The upstream then stops writing into this node and, once
+ * this node has drained, is told to continue. The signal therefore travels
+ * backwards along the ring, hop by hop, so a slow node throttles the whole
+ * circulation instead of overflowing a single buffer.
  */
 static void send_backpressure_signal(icss_socket_t socket, char operation)
 {
@@ -1248,8 +1494,8 @@ static void send_backpressure_signal(icss_socket_t socket, char operation)
 
 /*
  * Evaluate the local queue watermarks. When the queue is too full this node
- * asks its downstream neighbour to pause, and once the queue drains it lets
- * the neighbour continue.
+ * asks its upstream neighbour to pause, and once the queue drains it lets the
+ * upstream continue.
  */
 static void update_backpressure(void)
 {
@@ -1258,7 +1504,7 @@ static void update_backpressure(void)
     uint32_t low;
     int should_pause;
     int was_paused;
-    icss_socket_t downstream;
+    icss_socket_t upstream;
     pthread_mutex_lock(&queue_mutex);
     used = node_queue.count;
     was_paused = node_queue.paused;
@@ -1276,10 +1522,10 @@ static void update_backpressure(void)
     pthread_mutex_unlock(&queue_mutex);
     if (should_pause == -1) return;
     pthread_mutex_lock(&downstream_mutex);
-    downstream = downstream_socket;
+    upstream = upstream_socket;
     pthread_mutex_unlock(&downstream_mutex);
-    if (downstream == ICSS_INVALID_SOCKET) return;
-    send_backpressure_signal(downstream, should_pause ? ICSS_OP_PAUSE : ICSS_OP_RESUME);
+    if (upstream == ICSS_INVALID_SOCKET) return;
+    send_backpressure_signal(upstream, should_pause ? ICSS_OP_PAUSE : ICSS_OP_RESUME);
     pthread_mutex_lock(&stats_mutex);
     if (should_pause) ++node_pause_events;
     else ++node_resume_events;
@@ -1290,30 +1536,83 @@ static void update_backpressure(void)
 }
 
 /*
- * Enqueue a frame for the downstream neighbour. The queue is bounded: when it
- * is full the frame is dropped instead of blocking the relay path, because a
- * stalled relay would stall the whole ring.
+ * Enqueue a frame for the downstream neighbour.
+ *
+ * The queue holds every frame that is currently in flight. A dataset that is
+ * larger than the initial queue depth therefore has to be able to grow the
+ * queue, otherwise the frames that do not fit would be dropped and the read
+ * side could never assemble the dataset. The queue is therefore resized on
+ * demand, up to a hard limit. Blocking instead of growing is not an option:
+ * a stalled relay would stall the whole ring.
  */
+static int queue_grow_locked(void)
+{
+    uint32_t new_capacity;
+    icss_queue_item *items;
+    uint32_t index;
+    if (node_queue.capacity >= ICSS_QUEUE_MAX_FRAMES) {
+        return 0;
+    }
+    new_capacity = node_queue.capacity < 2U ? 2U : node_queue.capacity * 2U;
+    if (new_capacity > ICSS_QUEUE_MAX_FRAMES) {
+        new_capacity = ICSS_QUEUE_MAX_FRAMES;
+    }
+    items = (icss_queue_item *)calloc(new_capacity, sizeof(*items));
+    if (items == NULL) {
+        return 0;
+    }
+    /* Re-linearise the ring buffer so that the head ends up at index 0. */
+    for (index = 0; index < node_queue.count; ++index) {
+        uint32_t slot = (node_queue.head + index) % node_queue.capacity;
+        items[index] = node_queue.items[slot];
+    }
+    free(node_queue.items);
+    node_queue.items = items;
+    node_queue.capacity = new_capacity;
+    node_queue.head = 0;
+    return 1;
+}
+
 static int queue_downstream_frame(const icss_frame_header *header,
     unsigned char *payload)
 {
     int queued = 0;
-    pthread_mutex_lock(&queue_mutex);
-    if (node_queue.count < node_queue.capacity) {
-        uint32_t tail = (node_queue.head + node_queue.count) % node_queue.capacity;
-        node_queue.items[tail].header = *header;
-        node_queue.items[tail].payload = payload;
-        ++node_queue.count;
-        queued = 1;
+    int attempt;
+    /*
+     * The queue has to absorb the frames that are in flight. If it is full the
+     * frame is retried for a while instead of being dropped, because a dropped
+     * frame would leave a hole in the dataset that the read side can never
+     * fill. The backpressure signal tells the upstream to stop sending, so the
+     * queue drains again shortly.
+     */
+    for (attempt = 0; attempt < 100; ++attempt) {
+        pthread_mutex_lock(&queue_mutex);
+        if (node_queue.count == node_queue.capacity) {
+            (void)queue_grow_locked();
+        }
+        if (node_queue.count < node_queue.capacity) {
+            uint32_t tail = (node_queue.head + node_queue.count) % node_queue.capacity;
+            node_queue.items[tail].header = *header;
+            node_queue.items[tail].payload = payload;
+            ++node_queue.count;
+            queued = 1;
+        }
+        pthread_mutex_unlock(&queue_mutex);
+        if (queued) {
+            return 1;
+        }
+        {
+            struct timespec pause;
+            pause.tv_sec = 0;
+            pause.tv_nsec = 50000000L;
+            nanosleep(&pause, NULL);
+        }
     }
-    pthread_mutex_unlock(&queue_mutex);
-    if (!queued) {
-        pthread_mutex_lock(&stats_mutex);
-        ++node_dropped_frames;
-        pthread_mutex_unlock(&stats_mutex);
-        return 0;
-    }
-    return 1;
+    pthread_mutex_lock(&stats_mutex);
+    ++node_dropped_frames;
+    pthread_mutex_unlock(&stats_mutex);
+    fprintf(stderr, "icss: downstream queue full, frame dropped\n");
+    return 0;
 }
 
 /*
@@ -1596,34 +1895,47 @@ static void *connection_worker(void *argument)
         }
     } else if (control[4] == ICSS_OP_FETCH) {
         unsigned char file_hash[32];
-        icss_subscriber *subscriber;
-        if (get_u16(control + 6) != node_ring_id ||
-            !socket_recv_all(client, file_hash, sizeof(file_hash))) {
+        unsigned char name[ICSS_NAME_SIZE];
+        unsigned char key_id[ICSS_KEY_ID_SIZE];
+        unsigned char control_flags = control[5];
+        int use_name = (control_flags & ICSS_FETCH_FLAG_NAME) != 0;
+        int have_key_id = (control_flags & ICSS_FETCH_FLAG_KEYID) != 0;
+        icss_subscriber *subscriber = NULL;
+
+        if (use_name) {
+            if (!socket_recv_all(client, name, ICSS_NAME_SIZE) ||
+                (have_key_id && !socket_recv_all(client, key_id, ICSS_KEY_ID_SIZE))) {
+                icss_socket_close(client);
+                return NULL;
+            }
+            name[ICSS_NAME_SIZE - 1] = '\0';
+            if (!lookup_hash_by_name((const char *)name,
+                have_key_id ? key_id : NULL, have_key_id, file_hash)) {
+                send_control(client, ICSS_OP_ERROR, node_ring_id, 0U);
+                icss_socket_close(client);
+                return NULL;
+            }
+        } else {
+            if (!socket_recv_all(client, file_hash, sizeof(file_hash))) {
+                icss_socket_close(client);
+                return NULL;
+            }
+        }
+        if (get_u16(control + 6) != node_ring_id) {
             icss_socket_close(client);
             return NULL;
         }
         pthread_mutex_lock(&index_mutex);
         {
-            icss_index_entry *entry = find_index_entry(file_hash);
-            uint32_t chunk_index;
-            int complete = entry != NULL && entry->chunk_seen != NULL;
             /*
              * The index is a pure hash catalogue: it answers whether this node
              * has seen the dataset at all. The reader decides on its own how
              * many shards it needs, because with erasure coding a group can be
-             * reconstructed from k of its k + m shards.
+             * reconstructed from k of its k + m shards. The lookup has to accept
+             * every layout of the file, because the reader does not know the
+             * frame count yet.
              */
-            if (complete) {
-                for (chunk_index = 0; chunk_index < entry->total_chunks; ++chunk_index) {
-                    if (entry->chunk_seen[chunk_index]) {
-                        complete = 1;
-                        break;
-                    }
-                }
-                if (complete && chunk_index == entry->total_chunks) {
-                    complete = 0;
-                }
-            }
+            int complete = index_has_seen_chunks(file_hash);
             pthread_mutex_unlock(&index_mutex);
             if (!complete) {
                 (void)socket_send_all(client, (const unsigned char *)"MISS", 4U);
@@ -1780,6 +2092,76 @@ static void *connection_worker(void *argument)
                 response_used += (size_t)snprintf(response + response_used,
                     response_capacity - response_used,
                     ",\"uptime\":%llu}\n", uptime);
+                (void)socket_send_all(client, (const unsigned char *)response,
+                    response_used);
+            }
+            free(response);
+        }
+    } else if (control[4] == ICSS_OP_LIST) {
+        /*
+         * Catalogue query. The node answers with every dataset it knows about,
+         * including the human readable name, the content hash and the key
+         * fingerprint. A client that holds a key can compare the fingerprint
+         * and thereby learn which datasets it is actually able to decrypt.
+         */
+        char *response;
+        size_t response_capacity;
+        size_t response_used = 0;
+        icss_index_entry *entry;
+        uint32_t entries = 0;
+        pthread_mutex_lock(&index_mutex);
+        for (entry = index_entries; entry != NULL; entry = entry->next) {
+            if (entry->chunk_seen != NULL) ++entries;
+        }
+        response_capacity = 256U + (size_t)entries * 320U;
+        pthread_mutex_unlock(&index_mutex);
+        response = (char *)malloc(response_capacity);
+        if (response != NULL) {
+            int count = snprintf(response, response_capacity, "{\"ring_id\":%u,\"files\":[",
+                (unsigned int)node_ring_id);
+            if (count > 0) response_used = (size_t)count;
+            pthread_mutex_lock(&index_mutex);
+            for (entry = index_entries; entry != NULL; entry = entry->next) {
+                uint32_t index;
+                int complete = 1;
+                if (entry->chunk_seen == NULL) continue;
+                for (index = 0; index < entry->total_chunks; ++index) {
+                    if (!entry->chunk_seen[index]) {
+                        complete = 0;
+                        break;
+                    }
+                }
+                if (!complete) continue;
+                if (response_used + 320U >= response_capacity) break;
+                if (response_used > 24U) {
+                    response_used += (size_t)snprintf(response + response_used,
+                        response_capacity - response_used, ",");
+                }
+                response_used += (size_t)snprintf(response + response_used,
+                    response_capacity - response_used, "{\"name\":\"%s\",\"sha256\":\"",
+                    entry->name);
+                for (index = 0; index < 32U; ++index) {
+                    response_used += (size_t)snprintf(response + response_used,
+                        response_capacity - response_used, "%02x", entry->file_hash[index]);
+                }
+                response_used += (size_t)snprintf(response + response_used,
+                    response_capacity - response_used, "\",\"encrypted\":%s,\"key_id\":\"",
+                    entry->encrypted ? "true" : "false");
+                for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
+                    response_used += (size_t)snprintf(response + response_used,
+                        response_capacity - response_used, "%02x", entry->key_id[index]);
+                }
+                response_used += (size_t)snprintf(response + response_used,
+                    response_capacity - response_used,
+                    "\",\"total_chunks\":%u,\"first_seen\":%llu,\"last_seen\":%llu}",
+                    entry->total_chunks,
+                    (unsigned long long)entry->first_seen,
+                    (unsigned long long)entry->last_seen);
+            }
+            pthread_mutex_unlock(&index_mutex);
+            if (response_used + 32U < response_capacity) {
+                response_used += (size_t)snprintf(response + response_used,
+                    response_capacity - response_used, "]}\n");
                 (void)socket_send_all(client, (const unsigned char *)response,
                     response_used);
             }
@@ -1989,6 +2371,33 @@ static void receive_discovery(void)
     }
     upsert_peer(advertised_ip, tcp_port, ring_id, packet + 4);
     OPENSSL_cleanse(expected_id, sizeof(expected_id));
+
+    /*
+     * Reply to the discovery requester with our own heartbeat so that
+     * discover_ring_peers (which does not know our address yet) can learn
+     * about this node and add it to the peer list.
+     */
+    {
+        unsigned char response[ICSS_DISCOVERY_SIZE];
+        unsigned char self_id[16];
+        struct sockaddr_in target;
+        memset(&target, 0, sizeof(target));
+        target.sin_family = AF_INET;
+        target.sin_addr = source.sin_addr;
+        target.sin_port = source.sin_port;
+
+        make_node_id(node_advertise_ip,
+            (uint16_t)strtoul(node_listen_port, NULL, 10), self_id);
+        memcpy(response, "ICSD", 4);
+        memcpy(response + 4, self_id, sizeof(self_id));
+        memcpy(response + 20, &node_advertise_ip, 4);
+        put_u16(response + 24, (uint16_t)strtoul(node_listen_port, NULL, 10));
+        put_u16(response + 26, node_ring_id);
+        put_u64(response + 28, (uint64_t)time(NULL));
+        OPENSSL_cleanse(self_id, sizeof(self_id));
+        (void)sendto(discovery_socket, (const char *)response, sizeof(response), 0,
+            (struct sockaddr *)&target, (int)sizeof(target));
+    }
 }
 
 static void update_topology(void)
@@ -2408,7 +2817,115 @@ cleanup:
  *
  * Encryption happens after the erasure encoding, so the parity shards are
  * computed over the plaintext and the ciphertext stays opaque to the relays.
+  */
+
+/*
+ * Check whether a dataset with the given name is already registered on the
+ * node at 'endpoint'. Under one key, file names must be unique: an encrypted
+ * file matches when its key fingerprint equals the given key_id; an
+ * unencrypted file matches on name alone.
+ *
+ * Returns 1 if a matching entry exists, 0 if not found, 2 on error.
  */
+static int name_exists_on_endpoint(const char *endpoint, uint16_t ring_id,
+    const char *name, const unsigned char key_id[ICSS_KEY_ID_SIZE],
+    int have_key)
+{
+    char host[256];
+    char port[16];
+    char *response = NULL;
+    size_t response_capacity = 0, used = 0;
+    icss_socket_t socket;
+    int result = 2;
+
+    if (!parse_endpoint(endpoint, host, sizeof(host), port, sizeof(port)) ||
+        !socket_runtime_start()) {
+        return 2;
+    }
+    socket = connect_to(host, port);
+    if (socket == ICSS_INVALID_SOCKET ||
+        !send_control(socket, ICSS_OP_LIST, ring_id, have_key ? 1U : 0U)) {
+        if (socket != ICSS_INVALID_SOCKET) icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+
+    response = (char *)malloc(8192U);
+    if (!response) {
+        icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+    response_capacity = 8192U;
+    used = 0;
+    for (;;) {
+        int count;
+        if (used + 1024U >= response_capacity) {
+            char *bigger_ptr;
+            response_capacity *= 2U;
+            bigger_ptr = (char *)realloc(response, response_capacity);
+            if (!bigger_ptr) break;
+            response = bigger_ptr;
+        }
+        count = recv(socket, response + used,
+            (int)(response_capacity - used - 1U), 0);
+        if (count <= 0) break;
+        used += (size_t)count;
+    }
+    response[used] = '\0';
+    icss_socket_close(socket);
+    socket_runtime_stop();
+
+    if (used == 0U) {
+        free(response);
+        return 2;
+    }
+
+    result = 0;
+    {
+        const char *cursor = response;
+        while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
+            char file_name[ICSS_NAME_SIZE];
+            char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
+            char encrypted_text[16];
+            int encrypted;
+            const char *record_end = strchr(cursor, '}');
+            if (!record_end) break;
+            if (!json_get_string(cursor, "name", file_name, sizeof(file_name)) ||
+                !json_get_string(cursor, "key_id", key_id_text,
+                    sizeof(key_id_text))) {
+                break;
+            }
+            if (!json_get_string(cursor, "encrypted", encrypted_text,
+                sizeof(encrypted_text))) {
+                encrypted_text[0] = '\0';
+            }
+            encrypted = strcmp(encrypted_text, "true") == 0;
+            if (strcmp(file_name, name) == 0) {
+                if (!encrypted) {
+                    result = 1;
+                    break;
+                }
+                if (have_key) {
+                    char expected[ICSS_KEY_ID_SIZE * 2 + 1];
+                    unsigned int index;
+                    for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
+                        snprintf(expected + index * 2U, 3U, "%02x",
+                            key_id[index]);
+                    }
+                    if (strcmp(expected, key_id_text) == 0) {
+                        result = 1;
+                        break;
+                    }
+                }
+            }
+            cursor = record_end + 1;
+        }
+    }
+    free(response);
+    return result;
+}
+
 static int command_inject(const char *path, const char *endpoint,
     uint16_t ring_id, uint32_t chunk_size, const char *key_path,
     uint8_t data_shards, uint8_t parity_shards)
@@ -2416,6 +2933,8 @@ static int command_inject(const char *path, const char *endpoint,
     FILE *file = NULL;
     icss_socket_t socket = ICSS_INVALID_SOCKET;
     unsigned char key[32];
+    unsigned char key_id[ICSS_KEY_ID_SIZE];
+    char dataset_name[ICSS_NAME_SIZE];
     unsigned char file_hash[32];
     unsigned char *payload = NULL;
     unsigned char *group_buffer = NULL;
@@ -2446,6 +2965,45 @@ static int command_inject(const char *path, const char *endpoint,
     memset(key, 0, sizeof(key));
     if (encrypted && !load_aes256_key(key_path, key)) {
         return 2;
+    }
+    /*
+     * The key fingerprint identifies the AES key that protects this dataset.
+     * For an unencrypted dataset it stays all zero, which marks the dataset as
+     * readable without any key.
+     */
+    memset(key_id, 0, sizeof(key_id));
+    if (encrypted && !compute_key_id(key, key_id)) {
+        fprintf(stderr, "icss: cannot compute the key fingerprint\n");
+        return 2;
+    }
+    /* The base name of the file travels with the dataset as its label. */
+    {
+        const char *base = path;
+        const char *cursor = path;
+        while (*cursor != '\0') {
+            if (*cursor == '/' || *cursor == '\\') base = cursor + 1;
+            ++cursor;
+        }
+        copy_bounded(dataset_name, ICSS_NAME_SIZE, base);
+    }
+    /*
+     * Reject the injection if a file with the same name already exists under
+     * the same key on the target node. File names are unique per key.
+     */
+    {
+        int name_exists = name_exists_on_endpoint(endpoint, ring_id,
+            dataset_name, key_id, encrypted);
+        if (name_exists == 1) {
+            fprintf(stderr, "icss: file '%s' already exists under this key "
+                "on %s, refusing to inject duplicate name\n",
+                dataset_name, endpoint);
+            goto cleanup;
+        }
+        if (name_exists == 2) {
+            fprintf(stderr, "icss: cannot verify name uniqueness on %s\n",
+                endpoint);
+            goto cleanup;
+        }
     }
     if (!hash_file_path(path, file_hash, &file_size)) {
         goto cleanup;
@@ -2562,6 +3120,8 @@ static int command_inject(const char *path, const char *endpoint,
             header.shard_pos = (uint8_t)shard_position;
             header.shard_group = group_index;
             memcpy(header.file_hash, file_hash, sizeof(file_hash));
+            memcpy(header.key_id, key_id, sizeof(key_id));
+            copy_bounded(header.name, ICSS_NAME_SIZE, dataset_name);
             memcpy(payload, source, payload_size);
             if (encrypted && !aes256_gcm_encrypt(key, &header, payload,
                 payload_size)) {
@@ -2746,7 +3306,464 @@ cleanup:
     return success;
 }
 
-static int command_fetch(const char *hash_text, const char *output_path,
+
+/* ========================================================================
+ * Name-to-hash resolution via LIST query
+ * ======================================================================== */
+/* ========================================================================
+ * Name-to-hash resolution via LIST query
+ * ======================================================================== */
+
+/*
+ * Look up a dataset hash by its human-readable name in the local index.
+ *
+ * Matches by name; for encrypted datasets the key fingerprint must also match,
+ * so that a client holding a key only resolves datasets it can decrypt.
+ *
+ * Returns 1 on success (out_hash set), 0 if not found.
+ */
+static int lookup_hash_by_name(const char *name,
+    const unsigned char key_id[ICSS_KEY_ID_SIZE], int have_key_id,
+    unsigned char out_hash[32])
+{
+    icss_index_entry *entry;
+    pthread_mutex_lock(&index_mutex);
+    for (entry = index_entries; entry != NULL; entry = entry->next) {
+        if (entry->chunk_seen == NULL) continue;
+        if (strcmp(entry->name, name) != 0) continue;
+        if (entry->encrypted) {
+            if (!have_key_id) continue;
+            if (memcmp(entry->key_id, key_id, ICSS_KEY_ID_SIZE) != 0) continue;
+        }
+        memcpy(out_hash, entry->file_hash, 32);
+        pthread_mutex_unlock(&index_mutex);
+        return 1;
+    }
+    pthread_mutex_unlock(&index_mutex);
+    return 0;
+}
+
+static int resolve_name_to_hash(const char *endpoint, uint16_t ring_id,
+    const char *name, const unsigned char key_id[ICSS_KEY_ID_SIZE],
+    int have_key, unsigned char out_hash[32])
+{
+    char host[256];
+    char port[16];
+    icss_socket_t socket;
+    char *response = NULL;
+    size_t response_capacity = 0, used = 0;
+    int result = 2;
+
+    if (!parse_endpoint(endpoint, host, sizeof(host), port, sizeof(port)) ||
+        !socket_runtime_start()) {
+        return 2;
+    }
+    socket = connect_to(host, port);
+    if (socket == ICSS_INVALID_SOCKET ||
+        !send_control(socket, ICSS_OP_LIST, ring_id, 0)) {  /* have_key=0: we just need the catalogue */
+        if (socket != ICSS_INVALID_SOCKET) icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+    response = (char *)malloc(8192U);
+    if (!response) {
+        icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+    response_capacity = 8192U;
+    used = 0;
+    for (;;) {
+        if (used + 1024U >= response_capacity) {
+            char *bigger;
+            response_capacity *= 2U;
+            char *bigger_ptr = (char *)realloc(response, response_capacity);
+            if (!bigger_ptr) break;
+            response = bigger_ptr;
+        }
+        int count = recv(socket, response + used, (int)(response_capacity - used - 1U), 0);
+        if (count <= 0) break;
+        used += (size_t)count;
+    }
+    response[used] = '\0';
+    icss_socket_close(socket);
+    socket_runtime_stop();
+
+    if (used == 0U) {
+        fprintf(stderr, "icss: empty catalogue response\n");
+        free(response);
+        return 2;
+    }
+
+    int found = 0;
+    const char *cursor = response;
+    while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
+        char file_name[ICSS_NAME_SIZE];
+        char hash[65];
+        char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
+        char encrypted_text[16];
+        const char *record_end = strchr(cursor, '}');
+        if (!record_end) break;
+        if (!json_get_string(cursor, "name", file_name, sizeof(file_name)) ||
+            !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
+            !json_get_string(cursor, "key_id", key_id_text, sizeof(key_id_text))) {
+            break;
+        }
+        if (!json_get_string(cursor, "encrypted", encrypted_text, sizeof(encrypted_text))) {
+            encrypted_text[0] = '\0';
+        }
+        int encrypted = strcmp(encrypted_text, "true") == 0;
+        if (strcmp(file_name, name) == 0) {
+            if (!encrypted) {
+                /* 鏄庢枃鏂囦欢锛氱洿鎺ヨ繑鍥?*/
+                if (!parse_hash(hash, out_hash)) { found = 0; break; }
+                found = 1;
+                break;
+            }
+            /* 鍔犲瘑鏂囦欢锛氬繀椤绘湁 key 涓?key_id 鍖归厤 */
+            {
+                char expected[ICSS_KEY_ID_SIZE * 2 + 1];
+                unsigned int index;
+                for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
+                    snprintf(expected + index * 2U, 3U, "%02x", key_id[index]);
+                }
+                if (strcmp(expected, key_id_text) == 0) {
+                    if (!parse_hash(hash, out_hash)) { found = 0; break; }
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        cursor = record_end + 1;
+    }
+    free(response);
+    return found ? 0 : 1;
+}
+
+/*
+ * Discover all peers in the ring via UDP broadcast.
+ * Returns the number of peers found, or -1 on error.
+ * The peers array must be allocated by the caller with capacity max_peers.
+ */
+static int discover_ring_peers(uint16_t discovery_port, uint16_t ring_id,
+    icss_peer *peers, int max_peers, int timeout_seconds)
+{
+    icss_socket_t sock;
+    struct sockaddr_in local_addr;
+    struct sockaddr_in broadcast_addr;
+    int opt = 1;
+    int peer_count = 0;
+    time_t start_time;
+    unsigned char packet[ICSS_DISCOVERY_SIZE];
+    struct sockaddr_in src_addr;
+    socklen_t src_len = sizeof(src_addr);
+
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == ICSS_INVALID_SOCKET) {
+        return -1;
+    }
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (const char *)&opt, sizeof(opt));
+
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_addr.sin_port = htons(0);  // ephemeral port
+    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) != 0) {
+        icss_socket_close(sock);
+        return -1;
+    }
+
+    /*
+     * Learn our own source IP address: open a temporary UDP socket to a
+     * public address and ask the kernel which local address it would use.
+     */
+    uint32_t local_ip = htonl(INADDR_LOOPBACK);
+    {
+        icss_socket_t probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (probe != ICSS_INVALID_SOCKET) {
+            struct sockaddr_in target;
+            struct sockaddr_in local;
+            socklen_t local_size = (socklen_t)sizeof(local);
+            memset(&target, 0, sizeof(target));
+            target.sin_family = AF_INET;
+            target.sin_addr.s_addr = inet_addr("8.8.8.8");
+            target.sin_port = htons(53U);
+            if (connect(probe, (struct sockaddr *)&target,
+                (int)sizeof(target)) == 0 &&
+                getsockname(probe, (struct sockaddr *)&local, &local_size) == 0 &&
+                local.sin_addr.s_addr != htonl(INADDR_ANY)) {
+                local_ip = local.sin_addr.s_addr;
+            }
+            icss_socket_close(probe);
+        }
+    }
+
+    /* Determine the ephemeral port assigned to our discovery socket. */
+    {
+        struct sockaddr_in local;
+        socklen_t local_size = (socklen_t)sizeof(local);
+        if (getsockname(sock, (struct sockaddr *)&local, &local_size) != 0) {
+            icss_socket_close(sock);
+            return -1;
+        }
+        local_addr = local;
+    }
+
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    broadcast_addr.sin_port = htons(discovery_port);
+
+    /*
+     * Build a valid discovery request so that nodes can verify our
+     * identity (advertised IP must match the source IP, node_id must
+     * match SHA-256 over IP:port).
+     */
+    unsigned char node_id[16];
+    make_node_id(local_ip,
+        (uint16_t)ntohs(local_addr.sin_port), node_id);
+
+    memset(packet, 0, sizeof(packet));
+    memcpy(packet, "ICSD", 4);
+    memcpy(packet + 4, node_id, sizeof(node_id));
+    memcpy(packet + 20, &local_ip, 4);
+    put_u16(packet + 24, (uint16_t)ntohs(local_addr.sin_port));
+    put_u16(packet + 26, ring_id);
+    put_u64(packet + 28, (uint64_t)time(NULL));
+    OPENSSL_cleanse(node_id, sizeof(node_id));
+
+    if (sendto(sock, (const char *)packet, sizeof(packet), 0,
+        (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+        icss_socket_close(sock);
+        return -1;
+    }
+
+    set_socket_timeout(sock, 1);
+    start_time = time(NULL);
+    while (time(NULL) - start_time < timeout_seconds && peer_count < max_peers) {
+        int received = recvfrom(sock, (char *)packet, sizeof(packet), 0,
+            (struct sockaddr *)&src_addr, &src_len);
+        if (received == (int)sizeof(packet) && memcmp(packet, "ICSD", 4) == 0) {
+            uint32_t advertised_ip;
+            uint16_t tcp_port;
+            uint16_t peer_ring_id;
+            uint64_t timestamp;
+            uint64_t now = (uint64_t)time(NULL);
+            unsigned char expected_id[16];
+
+            memcpy(&advertised_ip, packet + 20, 4);
+            tcp_port = get_u16(packet + 24);
+            peer_ring_id = get_u16(packet + 26);
+            timestamp = get_u64(packet + 28);
+
+            if (peer_ring_id != ring_id || tcp_port == 0U ||
+                advertised_ip != src_addr.sin_addr.s_addr ||
+                (timestamp > now ? timestamp - now : now - timestamp) > ICSS_PEER_TIMEOUT) {
+                continue;
+            }
+            make_node_id(advertised_ip, tcp_port, expected_id);
+            if (memcmp(expected_id, packet + 4, sizeof(expected_id)) != 0) {
+                OPENSSL_cleanse(expected_id, sizeof(expected_id));
+                continue;
+            }
+            OPENSSL_cleanse(expected_id, sizeof(expected_id));
+
+            /* Check if already in list */
+            int exists = 0;
+            for (int i = 0; i < peer_count; ++i) {
+                if (peers[i].ip_address == advertised_ip &&
+                    peers[i].tcp_port == tcp_port) {
+                    exists = 1;
+                    break;
+                }
+            }
+            if (!exists) {
+                peers[peer_count].ip_address = advertised_ip;
+                peers[peer_count].tcp_port = tcp_port;
+                peers[peer_count].ring_id = peer_ring_id;
+                peers[peer_count].last_seen = time(NULL);
+                memcpy(peers[peer_count].node_id, packet + 4, 16);
+                ++peer_count;
+            }
+        }
+    }
+    icss_socket_close(sock);
+    return peer_count;
+}
+
+/*
+ * Query LIST on a specific peer and search for a file by name.
+ * Returns 0 on success (found), 1 if not found, 2 on error.
+ * If found, out_hash is set and out_endpoint is filled with the peer's endpoint.
+ */
+static int query_peer_for_file(const icss_peer *peer, uint16_t ring_id,
+    const char *name, const unsigned char key_id[ICSS_KEY_ID_SIZE],
+    int have_key, unsigned char out_hash[32], char *out_endpoint, size_t endpoint_cap)
+{
+    char host[INET_ADDRSTRLEN];
+    char port[16];
+    char *response = NULL;
+    size_t response_capacity = 0, used = 0;
+    icss_socket_t socket;
+    struct in_addr addr;
+    int result = 2;
+
+    addr.s_addr = peer->ip_address;
+    if (inet_ntop(AF_INET, &addr, host, sizeof(host)) == NULL) {
+        return 2;
+    }
+    snprintf(port, sizeof(port), "%u", (unsigned int)peer->tcp_port);
+
+    if (!socket_runtime_start()) {
+        return 2;
+    }
+    socket = connect_to(host, port);
+    if (socket == ICSS_INVALID_SOCKET ||
+        !send_control(socket, ICSS_OP_LIST, ring_id, 0)) {
+        if (socket != ICSS_INVALID_SOCKET) icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+
+    response = (char *)malloc(8192U);
+    if (!response) {
+        icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+    response_capacity = 8192U;
+    used = 0;
+    for (;;) {
+        int count;
+        if (used + 1024U >= response_capacity) {
+            char *bigger;
+            response_capacity *= 2U;
+            char *bigger_ptr = (char *)realloc(response, response_capacity);
+            if (!bigger_ptr) break;
+            response = bigger_ptr;
+        }
+        count = recv(socket, response + used, (int)(response_capacity - used - 1U), 0);
+        if (count <= 0) break;
+        used += (size_t)count;
+    }
+    response[used] = '\0';
+    icss_socket_close(socket);
+    socket_runtime_stop();
+
+    if (used == 0U) {
+        free(response);
+        return 2;
+    }
+
+    const char *cursor = response;
+    while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
+        char file_name[ICSS_NAME_SIZE];
+        char hash[65];
+        char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
+        char encrypted_text[16];
+        int encrypted;
+        const char *record_end = strchr(cursor, '}');
+        if (!record_end) break;
+        if (!json_get_string(cursor, "name", file_name, sizeof(file_name)) ||
+            !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
+            !json_get_string(cursor, "key_id", key_id_text, sizeof(key_id_text))) {
+            break;
+        }
+        if (!json_get_string(cursor, "encrypted", encrypted_text, sizeof(encrypted_text))) {
+            encrypted_text[0] = '\0';
+        }
+        encrypted = strcmp(encrypted_text, "true") == 0;
+        if (strcmp(file_name, name) == 0) {
+            if (!encrypted) {
+                if (!parse_hash(hash, out_hash)) {
+                    result = 2;
+                    break;
+                }
+                snprintf(out_endpoint, endpoint_cap, "%s:%s", host, port);
+                result = 0;
+                break;
+            }
+            if (have_key) {
+                char expected[ICSS_KEY_ID_SIZE * 2 + 1];
+                unsigned int index;
+                for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
+                    snprintf(expected + index * 2U, 3U, "%02x", key_id[index]);
+                }
+                if (strcmp(expected, key_id_text) == 0) {
+                    if (!parse_hash(hash, out_hash)) {
+                        result = 2;
+                        break;
+                    }
+                    snprintf(out_endpoint, endpoint_cap, "%s:%s", host, port);
+                    result = 0;
+                    break;
+                }
+            }
+        }
+        cursor = record_end + 1;
+    }
+    free(response);
+    return result;
+}
+
+/*
+ * Resolve a file name to its hash by searching the entire ring.
+ * Returns 0 on success, 1 if not found, 2 on error.
+ * If found, out_hash is set and out_endpoint is filled with the peer endpoint where it was found.
+ */
+static int resolve_name_to_hash_in_ring(uint16_t discovery_port, uint16_t ring_id,
+    const char *name, const unsigned char key_id[ICSS_KEY_ID_SIZE],
+    int have_key, unsigned char out_hash[32], char *out_endpoint, size_t endpoint_cap)
+{
+    icss_peer peers[ICSS_MAX_PEERS];
+    int peer_count;
+    int found_count = 0;
+    unsigned char first_hash[32];
+    char first_endpoint[256];
+
+    peer_count = discover_ring_peers(discovery_port, ring_id, peers, ICSS_MAX_PEERS, 5);
+    if (peer_count <= 0) {
+        fprintf(stderr, "icss: no peers discovered in ring %u\n", (unsigned int)ring_id);
+        return 2;
+    }
+
+    fprintf(stderr, "icss: discovered %d peer(s) in ring %u\n", peer_count, (unsigned int)ring_id);
+
+    for (int i = 0; i < peer_count; ++i) {
+        unsigned char hash[32];
+        char endpoint[256];
+        int res = query_peer_for_file(&peers[i], ring_id, name, key_id, have_key,
+            hash, endpoint, sizeof(endpoint));
+        if (res == 0) {
+            if (found_count == 0) {
+                memcpy(first_hash, hash, 32);
+                strcpy(first_endpoint, endpoint);
+                ++found_count;
+            } else {
+                /* Check if it's the same file (same hash) or a different file with same name */
+                if (memcmp(first_hash, hash, 32) != 0) {
+                    fprintf(stderr, "icss: duplicate file name '%s' with different content found in ring\n", name);
+                    return 2;
+                }
+                /* Same file found on another peer, that's OK */
+            }
+        } else if (res == 2) {
+            fprintf(stderr, "icss: error querying peer %s:%u\n",
+                inet_ntoa(*(struct in_addr *)&peers[i].ip_address),
+                (unsigned int)peers[i].tcp_port);
+        }
+    }
+
+    if (found_count == 0) {
+        return 1;
+    }
+    memcpy(out_hash, first_hash, 32);
+    strcpy(out_endpoint, first_endpoint);
+    return 0;
+}
+
+static int command_fetch_by_hash(const char *hash_text, const char *output_path,
     const char *endpoint, uint16_t ring_id, const char *key_path)
 {
     icss_socket_t socket = ICSS_INVALID_SOCKET;
@@ -2813,8 +3830,6 @@ static int command_fetch(const char *hash_text, const char *output_path,
         if (header.ring_id != ring_id ||
             memcmp(header.file_hash, target_hash, sizeof(target_hash)) != 0 ||
             header.total_chunks > ICSS_MAX_CHUNKS ||
-            (header.flags & ICSS_FLAG_ENCRYPTED) != (key_path != NULL ?
-                ICSS_FLAG_ENCRYPTED : 0U) ||
             !sha256_buffer(payload, header.payload_size, digest) ||
             memcmp(digest, header.payload_hash, sizeof(digest)) != 0) {
             OPENSSL_cleanse(payload, header.payload_size);
@@ -2823,6 +3838,18 @@ static int command_fetch(const char *hash_text, const char *output_path,
             goto cleanup_runtime;
         }
         if (total_chunks == 0U) {
+            /*
+             * The first frame of the requested file defines the layout that the
+             * reader follows. Only a frame that is encrypted exactly when a key
+             * was supplied can be the reference, otherwise the reader would
+             * wait for shards it can never decrypt.
+             */
+            if ((header.flags & ICSS_FLAG_ENCRYPTED) != (key_path != NULL ?
+                ICSS_FLAG_ENCRYPTED : 0U)) {
+                OPENSSL_cleanse(payload, header.payload_size);
+                free(payload);
+                continue;
+            }
             total_chunks = header.total_chunks;
             chunk_size = header.chunk_size;
             expected_file_size = header.file_size;
@@ -2846,14 +3873,19 @@ static int command_fetch(const char *hash_text, const char *output_path,
             }
             output_created = 1;
         }
+        /*
+         * The same file can circulate under more than one layout, for example
+         * once plain and once erasure coded. The reader picked the first frame
+         * it saw as its reference layout and has to ignore the frames of the
+         * other layouts instead of aborting the whole read.
+         */
         if (header.total_chunks != total_chunks || header.chunk_size != chunk_size ||
             header.file_size != expected_file_size || header.chunk_id >= total_chunks ||
             header.data_shards != data_shards ||
             header.parity_shards != parity_shards) {
             OPENSSL_cleanse(payload, header.payload_size);
             free(payload);
-            fprintf(stderr, "icss: inconsistent dataset metadata\n");
-            goto cleanup_runtime;
+            continue;
         }
         if (!seen[header.chunk_id]) {
             seen[header.chunk_id] = 1U;
@@ -2961,6 +3993,384 @@ cleanup:
     free(shard_present);
     OPENSSL_cleanse(key, sizeof(key));
     OPENSSL_cleanse(target_hash, sizeof(target_hash));
+    return result;
+}
+static int command_fetch(const char *hash_text, const char *name,
+    const char *output_path, const char *endpoint,
+    uint16_t ring_id, const char *key_path, uint16_t discovery_port)
+{
+    unsigned char target_hash[32];
+    unsigned char key[32];
+    unsigned char key_id[ICSS_KEY_ID_SIZE];
+    int have_key = 0;
+    char resolved_endpoint[256];
+
+    if (key_path != NULL) {
+        memset(key, 0, sizeof(key));
+        if (!load_aes256_key(key_path, key) || !compute_key_id(key, key_id)) {
+            fprintf(stderr, "icss: cannot load/compute key\n");
+            return 2;
+        }
+        have_key = 1;
+    } else {
+        memset(key, 0, sizeof(key));
+        memset(key_id, 0, sizeof(key_id));
+    }
+
+    if (name) {
+        /* Search the entire ring for the file by name */
+        if (resolve_name_to_hash_in_ring(discovery_port, ring_id, name, key_id, have_key,
+            target_hash, resolved_endpoint, sizeof(resolved_endpoint)) != 0) {
+            fprintf(stderr, "icss: file '%s' not found or not accessible with the given key in ring %u\n", name, (unsigned int)ring_id);
+            return 1;
+        }
+        fprintf(stderr, "icss: found file '%s' at %s\n", name, resolved_endpoint);
+        /* Convert resolved hash to hex text for command_fetch_by_hash */
+        char hash_hex[65];
+        for (int hi = 0; hi < 32; ++hi) {
+            snprintf(hash_hex + hi * 2U, 3U, "%02x", target_hash[hi]);
+        }
+        hash_hex[64] = '\0';
+        return command_fetch_by_hash(hash_hex, output_path, resolved_endpoint, ring_id, key_path);
+    } else {
+        if (!parse_hash(hash_text, target_hash)) return 1;
+        return command_fetch_by_hash(hash_text, output_path, endpoint, ring_id, key_path);
+    }
+}
+
+/*
+ * Extract a string field from a JSON object.
+ *
+ * The node answers with a small, well known JSON document, so a full parser is
+ * not needed here. The function returns 1 when the field was found and 0
+ * otherwise.
+ */
+static int json_get_string(const char *json, const char *field, char *out,
+    size_t out_capacity)
+{
+    char pattern[64];
+    const char *cursor;
+    const char *start;
+    size_t length = 0;
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", field);
+    cursor = strstr(json, pattern);
+    if (cursor == NULL) {
+        return 0;
+    }
+    cursor += strlen(pattern);
+    start = cursor;
+    while (*cursor != '\0' && *cursor != '"') {
+        if (*cursor == '\\' && cursor[1] != '\0') ++cursor;
+        ++cursor;
+        ++length;
+    }
+    if (length >= out_capacity) {
+        length = out_capacity - 1U;
+    }
+    memcpy(out, start, length);
+    out[length] = '\0';
+    return 1;
+}
+
+/*
+ * Catalogue query on the client side.
+ *
+ * Without a key every dataset is listed. With a key only the datasets that the
+ * key can actually decrypt are listed: a dataset is decryptable when it is not
+ * encrypted at all, or when its key fingerprint matches the fingerprint of the
+ * given key.
+ */
+/*
+ * List the catalogue of the entire ring: discover all peers via UDP, query
+ * LIST on each, and print merged, deduplicated results. With a key, only
+ * datasets that the key can decrypt are shown.
+ *
+ * Returns 0 on success, 1 if nothing found, 2 on error.
+ */
+static int list_ring_catalogue(uint16_t discovery_port, uint16_t ring_id,
+    const unsigned char key_id[ICSS_KEY_ID_SIZE], int have_key)
+{
+    icss_peer peers[ICSS_MAX_PEERS];
+    int peer_count;
+    int found_any = 0;
+    int i;
+    unsigned char seen_hashes[1024U][32U];
+    int seen_count = 0;
+
+    peer_count = discover_ring_peers(discovery_port, ring_id, peers,
+        ICSS_MAX_PEERS, 5);
+    if (peer_count <= 0) {
+        fprintf(stderr, "icss: no peers discovered in ring %u\n",
+            (unsigned int)ring_id);
+        return 2;
+    }
+
+    fprintf(stderr, "icss: discovered %d peer(s) in ring %u\n",
+        peer_count, (unsigned int)ring_id);
+
+    printf("%-32s %-64s %-10s %s\n", "NAME", "SHA256", "ENCRYPTED", "KEY_ID");
+
+    for (i = 0; i < peer_count; ++i) {
+        char host[INET_ADDRSTRLEN];
+        char port[16];
+        char *response = NULL;
+        size_t response_capacity = 0, used = 0;
+        icss_socket_t socket;
+        struct in_addr addr;
+        const char *cursor;
+
+        addr.s_addr = peers[i].ip_address;
+        if (inet_ntop(AF_INET, &addr, host, sizeof(host)) == NULL) continue;
+        snprintf(port, sizeof(port), "%u", (unsigned int)peers[i].tcp_port);
+
+        if (!socket_runtime_start()) continue;
+        socket = connect_to(host, port);
+        if (socket == ICSS_INVALID_SOCKET ||
+            !send_control(socket, ICSS_OP_LIST, ring_id, have_key ? 1U : 0U)) {
+            if (socket != ICSS_INVALID_SOCKET) icss_socket_close(socket);
+            socket_runtime_stop();
+            continue;
+        }
+
+        response = (char *)malloc(8192U);
+        if (!response) {
+            icss_socket_close(socket);
+            socket_runtime_stop();
+            continue;
+        }
+        response_capacity = 8192U;
+        used = 0;
+        for (;;) {
+            int count;
+            if (used + 1024U >= response_capacity) {
+                char *bigger_ptr;
+                response_capacity *= 2U;
+                bigger_ptr = (char *)realloc(response, response_capacity);
+                if (!bigger_ptr) break;
+                response = bigger_ptr;
+            }
+            count = recv(socket, response + used,
+                (int)(response_capacity - used - 1U), 0);
+            if (count <= 0) break;
+            used += (size_t)count;
+        }
+        response[used] = '\0';
+        icss_socket_close(socket);
+        socket_runtime_stop();
+
+        if (used == 0U) {
+            free(response);
+            continue;
+        }
+
+        cursor = response;
+        while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
+            char name[ICSS_NAME_SIZE];
+            char hash[65];
+            char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
+            char encrypted_text[16];
+            int encrypted;
+            unsigned char hash_bytes[32];
+            int duplicate = 0;
+            int j;
+            const char *record_end = strchr(cursor, '}');
+            if (!record_end) break;
+            if (!json_get_string(cursor, "name", name, sizeof(name)) ||
+                !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
+                !json_get_string(cursor, "key_id", key_id_text,
+                    sizeof(key_id_text))) {
+                break;
+            }
+            if (!json_get_string(cursor, "encrypted", encrypted_text,
+                sizeof(encrypted_text))) {
+                encrypted_text[0] = '\0';
+            }
+            encrypted = strcmp(encrypted_text, "true") == 0;
+            if (!parse_hash(hash, hash_bytes)) {
+                cursor = record_end + 1;
+                continue;
+            }
+            /* Deduplicate across peers: same content hash appears on all nodes */
+            for (j = 0; j < seen_count; ++j) {
+                if (memcmp(seen_hashes[j], hash_bytes, 32U) == 0) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (!duplicate && seen_count < 1024) {
+                memcpy(seen_hashes[seen_count], hash_bytes, 32U);
+                ++seen_count;
+            }
+            if (duplicate) {
+                cursor = record_end + 1;
+                continue;
+            }
+            if (have_key && encrypted) {
+                if (strcmp(key_id_text, "") == 0) {
+                    cursor = record_end + 1;
+                    continue;
+                }
+                {
+                    char expected[ICSS_KEY_ID_SIZE * 2 + 1];
+                    unsigned int index;
+                    for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
+                        snprintf(expected + index * 2U, 3U, "%02x", key_id[index]);
+                    }
+                    if (strcmp(expected, key_id_text) != 0) {
+                        cursor = record_end + 1;
+                        continue;
+                    }
+                }
+            }
+            printf("%-32s %-64s %-10s %s\n", name, hash,
+                encrypted ? "yes" : "no", encrypted ? key_id_text : "-");
+            found_any = 1;
+            cursor = record_end + 1;
+        }
+        free(response);
+    }
+
+    if (!found_any) return 1;
+    return 0;
+}
+
+static int command_list(const char *endpoint, uint16_t ring_id,
+    const char *key_path, uint16_t discovery_port)
+{
+    char host[256];
+    char port[16];
+    char *response = NULL;
+    size_t response_capacity = 0;
+    size_t used = 0;
+    icss_socket_t socket;
+    unsigned char key[32];
+    unsigned char key_id[ICSS_KEY_ID_SIZE];
+    int have_key = 0;
+    int result = 2;
+    const char *cursor;
+
+    memset(key, 0, sizeof(key));
+    if (key_path != NULL) {
+        if (!load_aes256_key(key_path, key)) {
+            return 2;
+        }
+        if (!compute_key_id(key, key_id)) {
+            fprintf(stderr, "icss: cannot compute the key fingerprint\n");
+            return 2;
+        }
+        have_key = 1;
+    }
+
+    /*
+     * When no endpoint is given, search the entire ring: discover every peer
+     * via UDP and query LIST on each. Otherwise query the single named node.
+     */
+    if (!endpoint || endpoint[0] == '\0') {
+        return list_ring_catalogue(discovery_port, ring_id, key_id, have_key);
+    }
+
+    if (!parse_endpoint(endpoint, host, sizeof(host), port, sizeof(port))) {
+        fprintf(stderr, "icss: invalid endpoint\n");
+        return 1;
+    }
+    if (!socket_runtime_start()) {
+        return 2;
+    }
+    socket = connect_to(host, port);
+    if (socket == ICSS_INVALID_SOCKET ||
+        !send_control(socket, ICSS_OP_LIST, ring_id, (uint8_t)(have_key ? 1U : 0U))) {
+        fprintf(stderr, "icss: cannot query node %s:%s\n", host, port);
+        if (socket != ICSS_INVALID_SOCKET) {
+            icss_socket_close(socket);
+        }
+        socket_runtime_stop();
+        return 2;
+    }
+    /* Read until the peer closes the connection. */
+    response_capacity = 8192U;
+    response = (char *)malloc(response_capacity);
+    if (response == NULL) {
+        icss_socket_close(socket);
+        socket_runtime_stop();
+        return 2;
+    }
+    for (;;) {
+        int count;
+        if (used + 1024U >= response_capacity) {
+            char *bigger;
+            response_capacity *= 2U;
+            bigger = (char *)realloc(response, response_capacity);
+            if (bigger == NULL) {
+                break;
+            }
+            response = bigger;
+        }
+        count = recv(socket, response + used, (int)(response_capacity - used - 1U), 0);
+        if (count <= 0) {
+            break;
+        }
+        used += (size_t)count;
+    }
+    response[used] = '\0';
+    icss_socket_close(socket);
+    socket_runtime_stop();
+    if (used == 0U) {
+        fprintf(stderr, "icss: empty catalogue response\n");
+        free(response);
+        return 2;
+    }
+    /*
+     * Print the catalogue as a table: the name, the content hash and the key
+     * fingerprint. The rows that the given key cannot decrypt are skipped.
+     */
+    printf("%-32s %-64s %-10s %s\n", "NAME", "SHA256", "ENCRYPTED", "KEY_ID");
+    cursor = response;
+    while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
+        char name[ICSS_NAME_SIZE];
+        char hash[65];
+        char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
+        char encrypted_text[16];
+        int encrypted;
+        const char *record_end = strchr(cursor, '}');
+        if (record_end == NULL) {
+            break;
+        }
+        if (!json_get_string(cursor, "name", name, sizeof(name)) ||
+            !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
+            !json_get_string(cursor, "key_id", key_id_text, sizeof(key_id_text))) {
+            break;
+        }
+        if (!json_get_string(cursor, "encrypted", encrypted_text, sizeof(encrypted_text))) {
+            encrypted_text[0] = '\0';
+        }
+        encrypted = strcmp(encrypted_text, "true") == 0;
+        if (have_key) {
+            /* Only the datasets this key can really open are of interest. */
+            if (encrypted) {
+                if (strcmp(key_id_text, "") == 0) {
+                    cursor = record_end + 1;
+                    continue;
+                }
+                {
+                    char expected[ICSS_KEY_ID_SIZE * 2 + 1];
+                    unsigned int index;
+                    for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
+                        snprintf(expected + index * 2U, 3U, "%02x", key_id[index]);
+                    }
+                    if (strcmp(expected, key_id_text) != 0) {
+                        cursor = record_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        printf("%-32s %-64s %-10s %s\n", name, hash,
+            encrypted ? "yes" : "no", encrypted ? key_id_text : "-");
+        cursor = record_end + 1;
+    }
+    result = 0;
+    free(response);
+    OPENSSL_cleanse(key, sizeof(key));
     return result;
 }
 
@@ -3079,11 +4489,12 @@ cleanup:
     return success;
 }
 
-static int command_status(const char *endpoint, uint16_t ring_id, int list_files)
+static int command_status(const char *endpoint, uint16_t ring_id,
+    int list_files, uint16_t discovery_port)
 {
     char host[256];
     char port[16];
-    char response[2048];
+    char response[4096];
     size_t used = 0;
     icss_socket_t socket;
     if (!parse_endpoint(endpoint, host, sizeof(host), port, sizeof(port))) {
@@ -3094,8 +4505,7 @@ static int command_status(const char *endpoint, uint16_t ring_id, int list_files
         return 2;
     }
     socket = connect_to(host, port);
-    if (socket == ICSS_INVALID_SOCKET || !send_control(socket, 'S', ring_id,
-        list_files ? 1U : 0U)) {
+    if (socket == ICSS_INVALID_SOCKET || !send_control(socket, 'S', ring_id, 0U)) {
         fprintf(stderr, "icss: cannot query node %s:%s\n", host, port);
         if (socket != ICSS_INVALID_SOCKET) {
             icss_socket_close(socket);
@@ -3112,12 +4522,183 @@ static int command_status(const char *endpoint, uint16_t ring_id, int list_files
     }
     response[used] = '\0';
     icss_socket_close(socket);
-    socket_runtime_stop();
+
     if (used == 0U) {
         fprintf(stderr, "icss: empty status response\n");
+        socket_runtime_stop();
         return 2;
     }
-    fputs(response, stdout);
+
+    if (list_files) {
+        /*
+         * Discover every peer in the ring and collect the catalogue from each.
+         * Merge all file entries, deduplicating by content hash, and append a
+         * "files" array to the status JSON so the whole ring is listed.
+         */
+        icss_peer peers[ICSS_MAX_PEERS];
+        int peer_count = discover_ring_peers(discovery_port, ring_id,
+            peers, ICSS_MAX_PEERS, 5);
+        char *files_json = NULL;
+        size_t files_cap = 256U, files_used = 0U;
+        unsigned char seen_hashes[1024U][32U];
+        int seen_count = 0;
+        int i;
+
+        files_json = (char *)malloc(files_cap);
+        if (files_json == NULL) {
+            fprintf(stderr, "icss: out of memory\n");
+            socket_runtime_stop();
+            return 2;
+        }
+        files_used = (size_t)snprintf(files_json, files_cap, "\"files\":[");
+        int first_file = 1;
+
+        for (i = 0; i < peer_count; ++i) {
+            char p_host[INET_ADDRSTRLEN];
+            char p_port[16];
+            char *p_response = NULL;
+            size_t p_cap = 0, p_used = 0;
+            icss_socket_t psocket;
+            struct in_addr addr;
+            const char *cursor;
+
+            addr.s_addr = peers[i].ip_address;
+            if (inet_ntop(AF_INET, &addr, p_host, sizeof(p_host)) == NULL) continue;
+            snprintf(p_port, sizeof(p_port), "%u", (unsigned int)peers[i].tcp_port);
+
+            if (!socket_runtime_start()) continue;
+            psocket = connect_to(p_host, p_port);
+            if (psocket == ICSS_INVALID_SOCKET ||
+                !send_control(psocket, ICSS_OP_LIST, ring_id, 0U)) {
+                if (psocket != ICSS_INVALID_SOCKET) icss_socket_close(psocket);
+                socket_runtime_stop();
+                continue;
+            }
+
+            p_response = (char *)malloc(8192U);
+            if (!p_response) {
+                icss_socket_close(psocket);
+                socket_runtime_stop();
+                continue;
+            }
+            p_cap = 8192U;
+            p_used = 0;
+            for (;;) {
+                int count;
+                if (p_used + 1024U >= p_cap) {
+                    char *bigger_ptr;
+                    p_cap *= 2U;
+                    bigger_ptr = (char *)realloc(p_response, p_cap);
+                    if (!bigger_ptr) break;
+                    p_response = bigger_ptr;
+                }
+                count = recv(psocket, p_response + p_used,
+                    (int)(p_cap - p_used - 1U), 0);
+                if (count <= 0) break;
+                p_used += (size_t)count;
+            }
+            p_response[p_used] = '\0';
+            icss_socket_close(psocket);
+            socket_runtime_stop();
+
+            if (p_used == 0U) {
+                free(p_response);
+                continue;
+            }
+
+            cursor = p_response;
+            while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
+                char name[ICSS_NAME_SIZE];
+                char hash[65];
+                char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
+                char encrypted_text[16];
+                unsigned char hash_bytes[32];
+                int encrypted;
+                int duplicate = 0;
+                int j;
+                const char *record_end = strchr(cursor, '}');
+                if (!record_end) break;
+                if (!json_get_string(cursor, "name", name, sizeof(name)) ||
+                    !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
+                    !json_get_string(cursor, "key_id", key_id_text,
+                        sizeof(key_id_text))) {
+                    break;
+                }
+                if (!json_get_string(cursor, "encrypted", encrypted_text,
+                    sizeof(encrypted_text))) {
+                    encrypted_text[0] = '\0';
+                }
+                encrypted = strcmp(encrypted_text, "true") == 0;
+                if (!parse_hash(hash, hash_bytes)) {
+                    cursor = record_end + 1;
+                    continue;
+                }
+                for (j = 0; j < seen_count; ++j) {
+                    if (memcmp(seen_hashes[j], hash_bytes, 32U) == 0) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (!duplicate && seen_count < 1024) {
+                    memcpy(seen_hashes[seen_count], hash_bytes, 32U);
+                    ++seen_count;
+                }
+                if (duplicate) {
+                    cursor = record_end + 1;
+                    continue;
+                }
+                if (files_used + 200U >= files_cap) {
+                    char *bigger_ptr;
+                    files_cap *= 2U;
+                    bigger_ptr = (char *)realloc(files_json, files_cap);
+                    if (!bigger_ptr) {
+                        free(p_response);
+                        free(files_json);
+                        socket_runtime_stop();
+                        return 2;
+                    }
+                    files_json = bigger_ptr;
+                }
+                files_used += (size_t)snprintf(files_json + files_used,
+                    files_cap - files_used,
+                    "%s{\"name\":\"%s\",\"sha256\":\"%s\",\"encrypted\":%s,\"key_id\":\"%s\"}",
+                    first_file ? "" : ",", name, hash,
+                    encrypted ? "true" : "false", key_id_text);
+                first_file = 0;
+                cursor = record_end + 1;
+            }
+            free(p_response);
+        }
+
+        if (files_used + 8U >= files_cap) {
+            char *bigger_ptr;
+            files_cap = files_used + 16U;
+            bigger_ptr = (char *)realloc(files_json, files_cap);
+            if (!bigger_ptr) {
+                free(files_json);
+                socket_runtime_stop();
+                return 2;
+            }
+            files_json = bigger_ptr;
+        }
+        files_used += (size_t)snprintf(files_json + files_used,
+            files_cap - files_used, "]");
+
+        {
+            char *last_brace = strrchr(response, '}');
+            if (last_brace) {
+                *last_brace = '\0';
+                printf("%s,%s}\n", response, files_json);
+            } else {
+                printf("%s,%s}\n", response, files_json);
+            }
+        }
+        free(files_json);
+    } else {
+        fputs(response, stdout);
+    }
+
+    socket_runtime_stop();
     return 0;
 }
 
@@ -3132,8 +4713,9 @@ static void print_help(FILE *stream)
         "  +------------------+--------------------------------------------------+\n"
         "  | node             | Run a permanent storage node                     |\n"
         "  | inject           | Put a dataset into the ring                      |\n"
-        "  | fetch            | Read a dataset back from the ring                |\n"
+        "  | fetch            | Read a dataset by hash or name (searches ring)   |\n"
         "  | status           | Query the state of a node                        |\n"
+        "  | ls               | List the datasets in the ring catalogue          |\n"
         "  | hash             | Print a file's SHA-256 digest                    |\n"
         "  | protocol         | Print the wire frame layout                      |\n"
         "  | key-check        | Validate a 32-byte AES-256 key file              |\n"
@@ -3220,10 +4802,12 @@ static void print_protocol(void)
     puts("138     1     shard_pos");
     puts("139     1     reserved");
     puts("140     4     shard_group (network byte order)");
+    puts("144     32    key_id (SHA-256 fingerprint of the AES key)");
+    puts("176     64    file name (NUL padded)");
     puts("");
     puts("Control frames: 4 byte magic + operation + flags + ring_id (8 bytes total)");
     puts("  ICSF  'P' pause, 'R' resume  (backpressure, hop by hop)");
-    puts("  ICSC  'I' inject, 'F' fetch, 'S' status");
+    puts("  ICSC  'I' inject, 'F' fetch, 'S' status, 'L' list");
     puts("  ICSP  peer link handshake");
     puts("");
     puts("UDP discovery heartbeat: 36 bytes, magic ICSD, node id, ip, port, ring, time");
@@ -3248,11 +4832,22 @@ static void print_command_help(const char *command)
         puts("      --data-shards K        erasure code data shards per group");
         puts("      --parity-shards M      erasure code parity shards per group");
     } else if (strcmp(command, "fetch") == 0) {
-        puts("usage: icss fetch FILE_SHA256 OUTPUT_FILE IP:PORT [options]");
+        puts("usage: icss fetch [FILE_SHA256|--name NAME] OUTPUT_FILE [IP:PORT] [options]");
+        puts("      --name NAME            file name to fetch (searches entire ring)");
         puts("      --key KEYFILE          AES-256 key for encrypted datasets");
         puts("  -r, --ring-id ID           logical ring (default 0)");
+        puts("      --discovery-port PORT  UDP discovery port (default 7777)");
+        puts("");
+        puts("  When using --name, the entire ring is searched for the file.");
+        puts("  The file name must be unique within the same key (or unencrypted).");
+        puts("  IP:PORT is optional with --name, required with FILE_SHA256.");
     } else if (strcmp(command, "status") == 0) {
-        puts("usage: icss status IP:PORT [--ring-id ID] [--list-files]");
+        puts("usage: icss status IP:PORT [--ring-id ID] [--list-files] [--discovery-port PORT]");
+    } else if (strcmp(command, "ls") == 0) {
+        puts("usage: icss ls [IP:PORT] [--key KEYFILE] [--ring-id ID] [--discovery-port PORT]");
+        puts("Lists the datasets of the ring catalogue with their name and SHA-256.");
+        puts("Without IP:PORT, discovers all peers and lists the entire ring.");
+        puts("With --key only the datasets that the key can decrypt are listed.");
     } else if (strcmp(command, "erasure-check") == 0) {
         puts("usage: icss erasure-check [--data-shards K] [--parity-shards M] [--lost N]");
         puts("Verifies that a group survives the loss of N shards per group.");
@@ -3378,40 +4973,84 @@ static int command_inject_cli(int argc, char **argv)
 static int command_fetch_cli(int argc, char **argv)
 {
     const char *key_path = NULL;
+    const char *name = NULL;
+    const char *hash_text = NULL;
+    const char *output_path = NULL;
+    const char *endpoint = NULL;
     uint16_t ring_id = 0;
+    uint16_t discovery_port = 7777;
     int index;
     if (argc >= 3 && strcmp(argv[2], "--help") == 0) {
         print_command_help("fetch");
         return 0;
     }
-    if (argc < 5) {
-        fprintf(stderr, "usage: icss fetch FILE_SHA256 OUTPUT_FILE IP:PORT [options]\n");
+    if (argc < 4) {
+        fprintf(stderr, "usage: icss fetch [FILE_SHA256|--name NAME] OUTPUT_FILE [IP:PORT] [options]\n");
         return 1;
     }
-    for (index = 5; index < argc; ++index) {
+    /* Handle the first positional argument: either a hash or --name */
+    if (strcmp(argv[2], "--name") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "usage: icss fetch --name NAME OUTPUT_FILE [options]\n");
+            return 1;
+        }
+        name = argv[3];
+        index = 4;
+    } else {
+        hash_text = argv[2];
+        index = 3;
+    }
+    for (; index < argc; ++index) {
         const char *value;
         if (strcmp(argv[index], "--help") == 0 || strcmp(argv[index], "-h") == 0) {
             print_command_help("fetch");
             return 0;
+        } else if (strcmp(argv[index], "--name") == 0) {
+            if (!option_value(argc, argv, &index, &name)) return 1;
         } else if (strcmp(argv[index], "--key") == 0) {
             if (!option_value(argc, argv, &index, &key_path)) return 1;
         } else if (strcmp(argv[index], "--ring-id") == 0 || strcmp(argv[index], "-r") == 0) {
             if (!option_value(argc, argv, &index, &value) || !parse_ring_id(value, &ring_id)) return 1;
+        } else if (strcmp(argv[index], "--discovery-port") == 0) {
+            if (!option_value(argc, argv, &index, &value) ||
+                !parse_u32(value, 1U, UINT16_MAX, (uint32_t *)&discovery_port)) return 1;
+        } else if (!hash_text && !name) {
+            hash_text = argv[index];
+        } else if (!output_path) {
+            output_path = argv[index];
+        } else if (!endpoint) {
+            endpoint = argv[index];
         } else {
             fprintf(stderr, "icss: unknown fetch option '%s'\n", argv[index]);
             return 1;
         }
     }
-    return command_fetch(argv[2], argv[3], argv[4], ring_id, key_path);
+    /* hash_text 与 name 二选一，至少提供一个 */
+    if ((hash_text == NULL) == (name == NULL)) {
+        fprintf(stderr, "icss: exactly one of FILE_SHA256 or --name NAME must be given\n");
+        return 1;
+    }
+    if (!output_path) {
+        fprintf(stderr, "usage: icss fetch [FILE_SHA256|--name NAME] OUTPUT_FILE [IP:PORT] [options]\n");
+        return 1;
+    }
+    /* When using --name, endpoint is optional (will search entire ring).
+       When using hash, endpoint is required. */
+    if (hash_text && !endpoint) {
+        fprintf(stderr, "icss: endpoint IP:PORT required when using FILE_SHA256\n");
+        return 1;
+    }
+    return command_fetch(hash_text, name, output_path, endpoint ? endpoint : "", ring_id, key_path, discovery_port);
 }
 
 static int command_status_cli(int argc, char **argv)
 {
     uint16_t ring_id = 0;
     int list_files = 0;
+    uint16_t discovery_port = 7777;
     int index;
     if (argc < 3) {
-        fprintf(stderr, "usage: icss status IP:PORT [--ring-id ID]\n");
+        fprintf(stderr, "usage: icss status IP:PORT [--ring-id ID] [--list-files] [--discovery-port PORT]\n");
         return 1;
     }
     if (argc >= 3 && strcmp(argv[2], "--help") == 0) {
@@ -3424,14 +5063,58 @@ static int command_status_cli(int argc, char **argv)
             list_files = 1;
             continue;
         }
-        if (strcmp(argv[index], "--ring-id") != 0 ||
-            !option_value(argc, argv, &index, &value) ||
-            !parse_ring_id(value, &ring_id)) {
-            fprintf(stderr, "icss: invalid status option\n");
+        if (strcmp(argv[index], "--ring-id") == 0 || strcmp(argv[index], "-r") == 0) {
+            if (!option_value(argc, argv, &index, &value) || !parse_ring_id(value, &ring_id)) return 1;
+            continue;
+        }
+        if (strcmp(argv[index], "--discovery-port") == 0) {
+            if (!option_value(argc, argv, &index, &value) ||
+                !parse_u32(value, 1U, UINT16_MAX, (uint32_t *)&discovery_port)) return 1;
+            continue;
+        }
+        fprintf(stderr, "icss: invalid status option\n");
+        return 1;
+    }
+    return command_status(argv[2], ring_id, list_files, discovery_port);
+}
+
+static int command_list_cli(int argc, char **argv)
+{
+    const char *key_path = NULL;
+    const char *endpoint = NULL;
+    uint16_t ring_id = 0;
+    uint16_t discovery_port = 7777;
+    int index;
+    if (argc < 3) {
+        fprintf(stderr, "usage: icss ls [IP:PORT] [--key FILE] [--ring-id ID] [--discovery-port PORT]\n");
+        return 1;
+    }
+    if (argc >= 3 && strcmp(argv[2], "--help") == 0) {
+        print_command_help("ls");
+        return 0;
+    }
+    /* argv[2] may be an endpoint or the first option flag */
+    if (argv[2][0] != '-') {
+        endpoint = argv[2];
+    }
+    for (index = (endpoint ? 3 : 2); index < argc; ++index) {
+        const char *value;
+        if (strcmp(argv[index], "--help") == 0 || strcmp(argv[index], "-h") == 0) {
+            print_command_help("ls");
+            return 0;
+        } else if (strcmp(argv[index], "--key") == 0) {
+            if (!option_value(argc, argv, &index, &key_path)) return 1;
+        } else if (strcmp(argv[index], "--ring-id") == 0 || strcmp(argv[index], "-r") == 0) {
+            if (!option_value(argc, argv, &index, &value) || !parse_ring_id(value, &ring_id)) return 1;
+        } else if (strcmp(argv[index], "--discovery-port") == 0) {
+            if (!option_value(argc, argv, &index, &value) ||
+                !parse_u32(value, 1U, UINT16_MAX, (uint32_t *)&discovery_port)) return 1;
+        } else {
+            fprintf(stderr, "icss: unknown ls option '%s'\n", argv[index]);
             return 1;
         }
     }
-    return command_status(argv[2], ring_id, list_files);
+    return command_list(endpoint, ring_id, key_path, discovery_port);
 }
 
 static int command_erasure_check_cli(int argc, char **argv)
@@ -3509,6 +5192,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "inject") == 0) return command_inject_cli(argc, argv);
     if (strcmp(argv[1], "fetch") == 0) return command_fetch_cli(argc, argv);
     if (strcmp(argv[1], "status") == 0) return command_status_cli(argc, argv);
+    if (strcmp(argv[1], "ls") == 0) return command_list_cli(argc, argv);
     if (strcmp(argv[1], "erasure-check") == 0) return command_erasure_check_cli(argc, argv);
     fprintf(stderr, "icss: unsupported command '%s'\n", argv[1]);
     fprintf(stderr, "icss: use 'icss help' for commands\n");
