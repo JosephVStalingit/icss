@@ -274,8 +274,11 @@ static int lookup_hash_by_name(const char *name,
     unsigned char out_hash[32]);
 static int send_control(icss_socket_t socket, char operation, uint16_t ring_id,
     uint8_t flags);
-static int json_get_string(const char *json, const char *field, char *out,
-    size_t out_capacity);
+static int parse_catalogue_record(const char *record,
+    char *name, size_t name_cap,
+    char *hash, size_t hash_cap,
+    char *key_id_text, size_t key_id_cap,
+    int *encrypted);
 
 static int sha256_buffer(const unsigned char *data, size_t size,
     unsigned char digest[32]);
@@ -2886,21 +2889,16 @@ static int name_exists_on_endpoint(const char *endpoint, uint16_t ring_id,
         const char *cursor = response;
         while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
             char file_name[ICSS_NAME_SIZE];
+            char hash_dummy[65];
             char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
-            char encrypted_text[16];
             int encrypted;
             const char *record_end = strchr(cursor, '}');
             if (!record_end) break;
-            if (!json_get_string(cursor, "name", file_name, sizeof(file_name)) ||
-                !json_get_string(cursor, "key_id", key_id_text,
-                    sizeof(key_id_text))) {
+            if (!parse_catalogue_record(cursor, file_name, sizeof(file_name),
+                hash_dummy, sizeof(hash_dummy), key_id_text,
+                sizeof(key_id_text), &encrypted)) {
                 break;
             }
-            if (!json_get_string(cursor, "encrypted", encrypted_text,
-                sizeof(encrypted_text))) {
-                encrypted_text[0] = '\0';
-            }
-            encrypted = strcmp(encrypted_text, "true") == 0;
             if (strcmp(file_name, name) == 0) {
                 if (!encrypted) {
                     result = 1;
@@ -3034,7 +3032,7 @@ static int command_inject(const char *path, const char *endpoint,
         goto cleanup;
     }
     if (!socket_runtime_start()) {
-        goto cleanup;
+        goto cleanup_runtime;
     }
     socket = connect_to(host, port);
     if (socket == ICSS_INVALID_SOCKET ||
@@ -3343,103 +3341,6 @@ static int lookup_hash_by_name(const char *name,
     return 0;
 }
 
-static int resolve_name_to_hash(const char *endpoint, uint16_t ring_id,
-    const char *name, const unsigned char key_id[ICSS_KEY_ID_SIZE],
-    int have_key, unsigned char out_hash[32])
-{
-    char host[256];
-    char port[16];
-    icss_socket_t socket;
-    char *response = NULL;
-    size_t response_capacity = 0, used = 0;
-    int result = 2;
-
-    if (!parse_endpoint(endpoint, host, sizeof(host), port, sizeof(port)) ||
-        !socket_runtime_start()) {
-        return 2;
-    }
-    socket = connect_to(host, port);
-    if (socket == ICSS_INVALID_SOCKET ||
-        !send_control(socket, ICSS_OP_LIST, ring_id, 0)) {  /* have_key=0: we just need the catalogue */
-        if (socket != ICSS_INVALID_SOCKET) icss_socket_close(socket);
-        socket_runtime_stop();
-        return 2;
-    }
-    response = (char *)malloc(8192U);
-    if (!response) {
-        icss_socket_close(socket);
-        socket_runtime_stop();
-        return 2;
-    }
-    response_capacity = 8192U;
-    used = 0;
-    for (;;) {
-        if (used + 1024U >= response_capacity) {
-            char *bigger;
-            response_capacity *= 2U;
-            char *bigger_ptr = (char *)realloc(response, response_capacity);
-            if (!bigger_ptr) break;
-            response = bigger_ptr;
-        }
-        int count = recv(socket, response + used, (int)(response_capacity - used - 1U), 0);
-        if (count <= 0) break;
-        used += (size_t)count;
-    }
-    response[used] = '\0';
-    icss_socket_close(socket);
-    socket_runtime_stop();
-
-    if (used == 0U) {
-        fprintf(stderr, "icss: empty catalogue response\n");
-        free(response);
-        return 2;
-    }
-
-    int found = 0;
-    const char *cursor = response;
-    while ((cursor = strstr(cursor, "{\"name\":")) != NULL) {
-        char file_name[ICSS_NAME_SIZE];
-        char hash[65];
-        char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
-        char encrypted_text[16];
-        const char *record_end = strchr(cursor, '}');
-        if (!record_end) break;
-        if (!json_get_string(cursor, "name", file_name, sizeof(file_name)) ||
-            !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
-            !json_get_string(cursor, "key_id", key_id_text, sizeof(key_id_text))) {
-            break;
-        }
-        if (!json_get_string(cursor, "encrypted", encrypted_text, sizeof(encrypted_text))) {
-            encrypted_text[0] = '\0';
-        }
-        int encrypted = strcmp(encrypted_text, "true") == 0;
-        if (strcmp(file_name, name) == 0) {
-            if (!encrypted) {
-                /* 鏄庢枃鏂囦欢锛氱洿鎺ヨ繑鍥?*/
-                if (!parse_hash(hash, out_hash)) { found = 0; break; }
-                found = 1;
-                break;
-            }
-            /* 鍔犲瘑鏂囦欢锛氬繀椤绘湁 key 涓?key_id 鍖归厤 */
-            {
-                char expected[ICSS_KEY_ID_SIZE * 2 + 1];
-                unsigned int index;
-                for (index = 0; index < ICSS_KEY_ID_SIZE; ++index) {
-                    snprintf(expected + index * 2U, 3U, "%02x", key_id[index]);
-                }
-                if (strcmp(expected, key_id_text) == 0) {
-                    if (!parse_hash(hash, out_hash)) { found = 0; break; }
-                    found = 1;
-                    break;
-                }
-            }
-        }
-        cursor = record_end + 1;
-    }
-    free(response);
-    return found ? 0 : 1;
-}
-
 /*
  * Discover all peers in the ring via UDP broadcast.
  * Returns the number of peers found, or -1 on error.
@@ -3637,7 +3538,6 @@ static int query_peer_for_file(const icss_peer *peer, uint16_t ring_id,
     for (;;) {
         int count;
         if (used + 1024U >= response_capacity) {
-            char *bigger;
             response_capacity *= 2U;
             char *bigger_ptr = (char *)realloc(response, response_capacity);
             if (!bigger_ptr) break;
@@ -3661,19 +3561,14 @@ static int query_peer_for_file(const icss_peer *peer, uint16_t ring_id,
         char file_name[ICSS_NAME_SIZE];
         char hash[65];
         char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
-        char encrypted_text[16];
         int encrypted;
         const char *record_end = strchr(cursor, '}');
         if (!record_end) break;
-        if (!json_get_string(cursor, "name", file_name, sizeof(file_name)) ||
-            !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
-            !json_get_string(cursor, "key_id", key_id_text, sizeof(key_id_text))) {
+        if (!parse_catalogue_record(cursor, file_name, sizeof(file_name),
+            hash, sizeof(hash), key_id_text,
+            sizeof(key_id_text), &encrypted)) {
             break;
         }
-        if (!json_get_string(cursor, "encrypted", encrypted_text, sizeof(encrypted_text))) {
-            encrypted_text[0] = '\0';
-        }
-        encrypted = strcmp(encrypted_text, "true") == 0;
         if (strcmp(file_name, name) == 0) {
             if (!encrypted) {
                 if (!parse_hash(hash, out_hash)) {
@@ -3716,6 +3611,7 @@ static int resolve_name_to_hash_in_ring(uint16_t discovery_port, uint16_t ring_i
     const char *name, const unsigned char key_id[ICSS_KEY_ID_SIZE],
     int have_key, unsigned char out_hash[32], char *out_endpoint, size_t endpoint_cap)
 {
+    (void)endpoint_cap;
     icss_peer peers[ICSS_MAX_PEERS];
     int peer_count;
     int found_count = 0;
@@ -3749,8 +3645,10 @@ static int resolve_name_to_hash_in_ring(uint16_t discovery_port, uint16_t ring_i
                 /* Same file found on another peer, that's OK */
             }
         } else if (res == 2) {
+            struct in_addr addr;
+            addr.s_addr = peers[i].ip_address;
             fprintf(stderr, "icss: error querying peer %s:%u\n",
-                inet_ntoa(*(struct in_addr *)&peers[i].ip_address),
+                inet_ntoa(addr),
                 (unsigned int)peers[i].tcp_port);
         }
     }
@@ -3795,7 +3693,7 @@ static int command_fetch_by_hash(const char *hash_text, const char *output_path,
         return 2;
     }
     if (!socket_runtime_start()) {
-        goto cleanup;
+        goto cleanup_runtime;
     }
     socket = connect_to(host, port);
     if (socket == ICSS_INVALID_SOCKET ||
@@ -3983,7 +3881,6 @@ cleanup_runtime:
         icss_socket_close(socket);
     }
     socket_runtime_stop();
-cleanup:
     free(seen);
     if (shard_buffer != NULL) {
         OPENSSL_cleanse(shard_buffer,
@@ -4039,36 +3936,107 @@ static int command_fetch(const char *hash_text, const char *name,
 }
 
 /*
- * Extract a string field from a JSON object.
+ * Parse all fields of one catalogue JSON record in a bounded scan.
+ * Extracts name, sha256, key_id and the encrypted flag from a record that
+ * starts at '{'. Returns 1 when all four fields were found, 0 otherwise.
  *
- * The node answers with a small, well known JSON document, so a full parser is
- * not needed here. The function returns 1 when the field was found and 0
- * otherwise.
+ * This avoids calling json_get_string four times per record (each of which
+ * re-scans the record with strstr), reducing the parse cost from O(4*fields)
+ * to a single bounded pass over the record text.
  */
-static int json_get_string(const char *json, const char *field, char *out,
-    size_t out_capacity)
+static int parse_catalogue_record(const char *record,
+    char *name, size_t name_cap,
+    char *hash, size_t hash_cap,
+    char *key_id_text, size_t key_id_cap,
+    int *encrypted)
 {
-    char pattern[64];
-    const char *cursor;
-    const char *start;
-    size_t length = 0;
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", field);
-    cursor = strstr(json, pattern);
-    if (cursor == NULL) {
-        return 0;
+    const char *end;
+    const char *p;
+    size_t len;
+
+    /* name */
+    p = strstr(record, "\"name\":\"");
+    if (!p) return 0;
+    p += 8;
+    end = strchr(p, '"');
+    if (!end) return 0;
+    len = (size_t)(end - p);
+    if (len + 1U > name_cap) len = name_cap - 1U;
+    memcpy(name, p, len);
+    name[len] = '\0';
+
+    /* sha256 */
+    p = strstr(record, "\"sha256\":\"");
+    if (!p) return 0;
+    p += 10;
+    end = strchr(p, '"');
+    if (!end) return 0;
+    len = (size_t)(end - p);
+    if (len + 1U > hash_cap) len = hash_cap - 1U;
+    memcpy(hash, p, len);
+    hash[len] = '\0';
+
+    /* key_id */
+    p = strstr(record, "\"key_id\":\"");
+    if (!p) return 0;
+    p += 10;
+    end = strchr(p, '"');
+    if (!end) return 0;
+    len = (size_t)(end - p);
+    if (len + 1U > key_id_cap) len = key_id_cap - 1U;
+    memcpy(key_id_text, p, len);
+    key_id_text[len] = '\0';
+
+    /* encrypted */
+    p = strstr(record, "\"encrypted\":");
+    if (!p) return 0;
+    p += 12;
+    *encrypted = (strncmp(p, "true", 4) == 0);
+
+    return 1;
+}
+
+/*
+ * Simple open-addressing hash set for 32-byte content hashes.
+ * Used to deduplicate catalogue entries across peers in O(1) expected time
+ * instead of O(n) linear search.
+ */
+#define ICSS_SEEN_CAP 1024U
+static unsigned char icss_seen_table[ICSS_SEEN_CAP][32U];
+static int icss_seen_used[ICSS_SEEN_CAP];
+static int icss_seen_count = 0;
+
+static void icss_seen_reset(void)
+{
+    memset(icss_seen_used, 0, sizeof(icss_seen_used));
+    icss_seen_count = 0;
+}
+
+static int icss_seen_contains(const unsigned char hash[32])
+{
+    uint32_t idx = ((uint32_t)hash[0] << 24) | ((uint32_t)hash[1] << 16) |
+                   ((uint32_t)hash[2] << 8) | (uint32_t)hash[3];
+    idx &= (uint32_t)(ICSS_SEEN_CAP - 1U);
+    while (icss_seen_used[idx]) {
+        if (memcmp(icss_seen_table[idx], hash, 32U) == 0) return 1;
+        idx = (idx + 1U) & (uint32_t)(ICSS_SEEN_CAP - 1U);
     }
-    cursor += strlen(pattern);
-    start = cursor;
-    while (*cursor != '\0' && *cursor != '"') {
-        if (*cursor == '\\' && cursor[1] != '\0') ++cursor;
-        ++cursor;
-        ++length;
+    return 0;
+}
+
+static int icss_seen_add(const unsigned char hash[32])
+{
+    if (icss_seen_count >= (int)ICSS_SEEN_CAP) return 0;
+    uint32_t idx = ((uint32_t)hash[0] << 24) | ((uint32_t)hash[1] << 16) |
+                   ((uint32_t)hash[2] << 8) | (uint32_t)hash[3];
+    idx &= (uint32_t)(ICSS_SEEN_CAP - 1U);
+    while (icss_seen_used[idx]) {
+        if (memcmp(icss_seen_table[idx], hash, 32U) == 0) return 0;
+        idx = (idx + 1U) & (uint32_t)(ICSS_SEEN_CAP - 1U);
     }
-    if (length >= out_capacity) {
-        length = out_capacity - 1U;
-    }
-    memcpy(out, start, length);
-    out[length] = '\0';
+    memcpy(icss_seen_table[idx], hash, 32U);
+    icss_seen_used[idx] = 1;
+    ++icss_seen_count;
     return 1;
 }
 
@@ -4094,8 +4062,8 @@ static int list_ring_catalogue(uint16_t discovery_port, uint16_t ring_id,
     int peer_count;
     int found_any = 0;
     int i;
-    unsigned char seen_hashes[1024U][32U];
-    int seen_count = 0;
+
+    icss_seen_reset();
 
     peer_count = discover_ring_peers(discovery_port, ring_id, peers,
         ICSS_MAX_PEERS, 5);
@@ -4168,43 +4136,25 @@ static int list_ring_catalogue(uint16_t discovery_port, uint16_t ring_id,
             char name[ICSS_NAME_SIZE];
             char hash[65];
             char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
-            char encrypted_text[16];
             int encrypted;
             unsigned char hash_bytes[32];
-            int duplicate = 0;
-            int j;
             const char *record_end = strchr(cursor, '}');
             if (!record_end) break;
-            if (!json_get_string(cursor, "name", name, sizeof(name)) ||
-                !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
-                !json_get_string(cursor, "key_id", key_id_text,
-                    sizeof(key_id_text))) {
+            if (!parse_catalogue_record(cursor, name, sizeof(name),
+                hash, sizeof(hash), key_id_text,
+                sizeof(key_id_text), &encrypted)) {
                 break;
             }
-            if (!json_get_string(cursor, "encrypted", encrypted_text,
-                sizeof(encrypted_text))) {
-                encrypted_text[0] = '\0';
-            }
-            encrypted = strcmp(encrypted_text, "true") == 0;
             if (!parse_hash(hash, hash_bytes)) {
                 cursor = record_end + 1;
                 continue;
             }
-            /* Deduplicate across peers: same content hash appears on all nodes */
-            for (j = 0; j < seen_count; ++j) {
-                if (memcmp(seen_hashes[j], hash_bytes, 32U) == 0) {
-                    duplicate = 1;
-                    break;
-                }
-            }
-            if (!duplicate && seen_count < 1024) {
-                memcpy(seen_hashes[seen_count], hash_bytes, 32U);
-                ++seen_count;
-            }
-            if (duplicate) {
+            /* Deduplicate across peers in O(1) expected time via hash set. */
+            if (icss_seen_contains(hash_bytes)) {
                 cursor = record_end + 1;
                 continue;
             }
+            icss_seen_add(hash_bytes);
             if (have_key && encrypted) {
                 if (strcmp(key_id_text, "") == 0) {
                     cursor = record_end + 1;
@@ -4329,21 +4279,16 @@ static int command_list(const char *endpoint, uint16_t ring_id,
         char name[ICSS_NAME_SIZE];
         char hash[65];
         char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
-        char encrypted_text[16];
         int encrypted;
         const char *record_end = strchr(cursor, '}');
         if (record_end == NULL) {
             break;
         }
-        if (!json_get_string(cursor, "name", name, sizeof(name)) ||
-            !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
-            !json_get_string(cursor, "key_id", key_id_text, sizeof(key_id_text))) {
+        if (!parse_catalogue_record(cursor, name, sizeof(name),
+            hash, sizeof(hash), key_id_text,
+            sizeof(key_id_text), &encrypted)) {
             break;
         }
-        if (!json_get_string(cursor, "encrypted", encrypted_text, sizeof(encrypted_text))) {
-            encrypted_text[0] = '\0';
-        }
-        encrypted = strcmp(encrypted_text, "true") == 0;
         if (have_key) {
             /* Only the datasets this key can really open are of interest. */
             if (encrypted) {
@@ -4540,9 +4485,9 @@ static int command_status(const char *endpoint, uint16_t ring_id,
             peers, ICSS_MAX_PEERS, 5);
         char *files_json = NULL;
         size_t files_cap = 256U, files_used = 0U;
-        unsigned char seen_hashes[1024U][32U];
-        int seen_count = 0;
         int i;
+
+        icss_seen_reset();
 
         files_json = (char *)malloc(files_cap);
         if (files_json == NULL) {
@@ -4611,42 +4556,25 @@ static int command_status(const char *endpoint, uint16_t ring_id,
                 char name[ICSS_NAME_SIZE];
                 char hash[65];
                 char key_id_text[ICSS_KEY_ID_SIZE * 2 + 1];
-                char encrypted_text[16];
                 unsigned char hash_bytes[32];
                 int encrypted;
-                int duplicate = 0;
-                int j;
                 const char *record_end = strchr(cursor, '}');
                 if (!record_end) break;
-                if (!json_get_string(cursor, "name", name, sizeof(name)) ||
-                    !json_get_string(cursor, "sha256", hash, sizeof(hash)) ||
-                    !json_get_string(cursor, "key_id", key_id_text,
-                        sizeof(key_id_text))) {
+                if (!parse_catalogue_record(cursor, name, sizeof(name),
+                    hash, sizeof(hash), key_id_text,
+                    sizeof(key_id_text), &encrypted)) {
                     break;
                 }
-                if (!json_get_string(cursor, "encrypted", encrypted_text,
-                    sizeof(encrypted_text))) {
-                    encrypted_text[0] = '\0';
-                }
-                encrypted = strcmp(encrypted_text, "true") == 0;
                 if (!parse_hash(hash, hash_bytes)) {
                     cursor = record_end + 1;
                     continue;
                 }
-                for (j = 0; j < seen_count; ++j) {
-                    if (memcmp(seen_hashes[j], hash_bytes, 32U) == 0) {
-                        duplicate = 1;
-                        break;
-                    }
-                }
-                if (!duplicate && seen_count < 1024) {
-                    memcpy(seen_hashes[seen_count], hash_bytes, 32U);
-                    ++seen_count;
-                }
-                if (duplicate) {
+                /* Deduplicate across peers in O(1) expected time via hash set. */
+                if (icss_seen_contains(hash_bytes)) {
                     cursor = record_end + 1;
                     continue;
                 }
+                icss_seen_add(hash_bytes);
                 if (files_used + 200U >= files_cap) {
                     char *bigger_ptr;
                     files_cap *= 2U;

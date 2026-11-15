@@ -44,7 +44,7 @@ make clean
 
 ### Windows
 
-推荐使用 MSYS2 MINGW64 GCC 与 OpenSSL。安装包后在 MSYS2 MINGW64 终端运行：
+使用 MSYS2 MINGW64 GCC 与 OpenSSL。安装包后在 MSYS2 MINGW64 终端运行：
 
 ```sh
 pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl make
@@ -57,13 +57,13 @@ build_windows.bat
 icss.exe help
 ```
 
-默认 OpenSSL 路径为 `C:\msys64\mingw64`，可用 `OPENSSL_ROOT` 环境变量覆盖。运行时需确保 `libcrypto-3-x64.dll` 可从 `PATH` 找到。
+默认使用**静态编译**：将 `libcrypto` 和 `libgcc` 编入二进制，运行时无需 `libcrypto-3-x64.dll`。如需动态链接，可编辑 `build_windows.bat` 去掉 `-static -static-libgcc` 并改用 `-lcrypto`。
 
-## Windows 安装（添加到系统 PATH）
+### Windows 安装（添加到系统 PATH）
 
 ### 方法一：手动添加（推荐）
 
-将 `icss.exe` 和 `libcrypto-3-x64.dll` 复制到任意目录（如 `C:\Tools\ICSS\`），然后添加到系统 PATH：
+将 `icss.exe` 复制到任意目录（如 `C:\Tools\ICSS\`），然后添加到系统 PATH：
 
 1. 按 `Win+S` 搜索 "环境变量" → 点击 "编辑系统环境变量"
 2. 点击 "环境变量" → 在"系统变量"区找到 `Path` → 编辑 → 新建
@@ -77,15 +77,13 @@ setx /M PATH "%PATH%;C:\Tools\ICSS"
 
 ### 方法二：当前目录直接运行
 
-确保 `libcrypto-3-x64.dll` 与 `icss.exe` 同目录：
 ```cmd
 icss.exe help
 ```
 
 ### 依赖库
 
-- `libcrypto-3-x64.dll` - OpenSSL 3.x 加密库（必需）
-- 来源：MSYS2 `mingw-w64-x86_64-openssl` 包，路径 `C:\msys64\mingw64\bin\`
+静态编译后无需外部 DLL。如需动态链接，运行时需确保 `libcrypto-3-x64.dll` 可从 `PATH` 找到（来源：MSYS2 `mingw-w64-x86_64-openssl` 包，路径 `C:\msys64\mingw64\bin\`）。
 
 ## CLI
 
